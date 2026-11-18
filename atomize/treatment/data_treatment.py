@@ -1,0 +1,2792 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Data Treatment control-center window.
+
+Standalone QProcess launched from the "EPR Endstation Control" tab. It loads a
+1D dataset either from a CSV file (Saver_Opener.open_1d) or from the curves
+currently shown in the main GUI (via the treatment_buffer.csv bridge that
+the plot sidebar writes), lets the user fit / FFT / phase-correct / smooth /
+integrate it,
+then push the result to LivePlot (general.plot_1d) and/or save it to CSV.
+
+The window has its own embedded pyqtgraph preview for live, in-process display:
+source curves and the current result are drawn there with smooth setData updates
+(no cross-process IPC), so dragging a spinbox while live-update is on stays
+responsive. Pushing to the main GUI is done only on demand via "Plot to GUI" —
+opened data is never auto-duplicated into the main window's docks.
+
+Operations can run on a single channel or on an I/Q pair (the "I/Q pair" box).
+In pair mode an FFT becomes a complex transform and smoothing/baseline is
+applied to both channels, so chains like baseline -> FFT -> phase keep both
+channels all the way through. Results carrying two channels (e.g. FFT real +
+imaginary) feed straight back in via "Result -> input".
+"""
+
+import os
+import re
+import sys
+from atomize.main.window_size import WindowSize
+import shutil
+import tempfile
+import numpy as np
+from pathlib import Path
+
+import pyqtgraph as pg
+from pyqtgraph.dockarea import DockArea
+from PyQt6.QtCore import Qt, QProcess, QUrl, QFileSystemWatcher, QTimer
+from PyQt6.QtGui import QIcon, QDesktopServices
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QComboBox, QVBoxLayout, QHBoxLayout, QTabWidget, QDoubleSpinBox,
+    QSpinBox, QLineEdit, QFrame, QSizePolicy, QScrollArea, QCheckBox)
+
+import atomize.general_modules.general_functions as general
+import atomize.general_modules.csv_opener_saver as openfile
+import atomize.general_modules.bruker_opener as bruker
+import atomize.math_modules.least_square_fitting_modules as fitting
+import atomize.math_modules.signal_processing as sigproc
+import atomize.math_modules.fft as fft_module
+# Parameter-header viewer shared with the 2D tool (separate non-modal window).
+from atomize.treatment.header_view import (HeaderWindow, read_header,
+                                                params_to_lines, header_frequency_shift)
+# Reuse the main-window plot stack so the embedded preview behaves identically
+# to the main UI (crosshair, Shift-drag ruler, FFT/log right-click toggles).
+from atomize.main.widgets import CrosshairPlotWidget, CloseableDock, CrosshairDock
+
+# Shared dark-theme palette / widget styles (single source of truth across all
+# control-center tools). apply_app_style() pins this process to the Fusion style
+# so QComboBox / QSpinBox / QLineEdit render identically on Linux and Windows.
+from atomize.general_modules.gui_style import (apply_app_style,
+    BG, FG, ACCENT, BUTTON_STYLE, LABEL_STYLE, DSPIN_STYLE, SPIN_STYLE,
+    CHECKBOX_STYLE, COMBO_STYLE, LINEEDIT_STYLE, SCROLL_STYLE, ANALYSIS_TAB_STYLE)
+
+# Shared form primitives: one label column per panel, long explanations behind
+# '?' chips, collapsible blocks for the secondary knobs.
+import atomize.general_modules.gui_forms as gui_forms
+from atomize.general_modules.gui_forms import FormPanel
+
+from atomize.treatment.paths import BUFFER_PATH, lastdir_path
+
+DATA_SAVE_FILTERS = ('CSV (*.csv)', 'HDF5 (*.h5)')
+
+# shared with the 2D tool and DEER analysis
+LASTDIR_PATH = lastdir_path('treatment')
+
+
+def _load_last_dir():
+    try:
+        with open(LASTDIR_PATH, 'r', errors='ignore') as fh:
+            d = fh.read().strip()
+        return d if d and os.path.isdir(d) else ''
+    except Exception:
+        return ''
+
+
+def _save_last_dir(path):
+    try:
+        d = path if os.path.isdir(path) else os.path.dirname(path)
+        if d:
+            with open(LASTDIR_PATH, 'w') as fh:
+                fh.write(d)
+    except Exception:
+        pass
+
+
+# Bare SI units worth auto-prefixing on the X axis: a plain 's' axis (e.g. a 2D
+# slice transferred in seconds) should read '2 ns', not '2e-9 s'. Already-prefixed
+# units ('ns', 'MHz') and dimensionless labels stay verbatim (no 'kns').
+SI_BASE_UNITS = {'s', 'hz', 'v', 'a', 'g', 't', 'k', 'm', 'ev'}
+
+
+def _si_autoprefix(unit):
+    """True if `unit` is a bare SI base worth pyqtgraph auto-prefixing."""
+    return str(unit).strip().lower() in SI_BASE_UNITS
+
+def _set_autoprefix(axis, on):
+    """Switch pyqtgraph auto-SI-prefixing on an axis; off also clears the prefix
+    and tick scale pyqtgraph keeps from the last range ('k%' after a kG axis)."""
+    axis.enableAutoSIPrefix(on)
+    if not on:
+        axis.autoSIPrefixScale = 1.0
+        axis.setLabel(axis.labelText, units=axis.labelUnits, unitPrefix='')
+
+
+def _split_unit(label):
+    """Split a 'Name (unit)' axis label into ('Name', 'unit'); ('label', '') if
+    there's no trailing parenthesised unit."""
+    s = str(label).strip()
+    if s.endswith(')') and '(' in s:
+        i = s.rfind('(')
+        return s[:i].strip(), s[i + 1:-1].strip()
+    return s, ''
+
+
+# Solid-accent "busy" variant for a button while a long operation is in
+# progress (explicit colours so it stays yellow even while disabled).
+BUTTON_BUSY_STYLE = (
+    f"QPushButton {{border-radius: 4px; background-color: {ACCENT}; "
+    f"border-style: inset; color: {BG}; font-weight: bold; padding: 4px; }} "
+    f"QPushButton:disabled {{background-color: {ACCENT}; color: {BG}; }}")
+
+
+_HELP_FFT = (
+    'I/Q pair → complex FFT of I+iQ; otherwise FFT of I. '
+    'Window applied before transform; passband masks the spectrum. '
+    'Skip pts drops leading points so the transform starts at the '
+    'echo centre (removes the dead-time first-order phase).')
+
+_HELP_FILTER = (
+    'FFT → zero the frequencies outside the passband → '
+    'inverse FFT. Output is the cleaned time-domain signal '
+    '(I/Q pair → both channels filtered together).'
+    '<br><br>'
+    'Low-pass uses High cutoff; High-pass uses Low cutoff; '
+    'Band-pass uses both. Cutoffs are fractions of the '
+    'maximum (Nyquist) frequency.')
+
+_HELP_PHASE = (
+    'Uses the selected I and Q channels. Time-domain correction applies a '
+    'constant phase in degrees and a frequency shift in MHz. Positive shifts '
+    'move the carrier toward higher frequency.<br><br>'
+    'Frequency-domain correction applies φ₀ + a(f − pivot) + b(f − pivot)², '
+    'with f and pivot in MHz, a in deg/MHz and b in deg/MHz². '
+    'For time-domain input, use FFT → Result → input before spectral correction. '
+    'The X axis name must include its time or frequency unit.')
+
+_HELP_SMOOTH = (
+    'I/Q pair → applied to both channels. "Baseline from" '
+    'fits the baseline using only the chosen end points.')
+
+_HELP_INTEGRATE = (
+    'Running integral by the trapezoid rule over the real X values. For a CW EPR '
+    'first-derivative spectrum: subtract its baseline on Smooth / Baseline '
+    '(First & last N), press Result → input, then integrate here. The first '
+    'integral is the absorption line; the double integral is proportional to the '
+    'number of spins.'
+    '<br><br>'
+    'Absorption baseline: a straight line through the first and last N points of '
+    'the first integral is subtracted before the second integration, so a small '
+    'offset left in the derivative does not grow into a quadratic drift.'
+    '<br><br>'
+    '∫ y dx is the first integral at the end of the window before that correction; '
+    'it is close to 0 when the derivative baseline is good. From = To integrates '
+    'the whole trace. I/Q pair → both channels.')
+
+
+def _cumtrapz(x, y):
+    """Running trapezoid integral of y over x, starting at 0."""
+    out = np.zeros(len(y))
+    if len(y) > 1:
+        out[1:] = np.cumsum(0.5*(y[1:] + y[:-1])*np.diff(x))
+    return out
+
+
+def _unit_product(yunit, xunit, power):
+    """Unit of the power-fold integral of y dx, e.g. ('V', 'G', 2) -> 'V·G²'."""
+    xpart = (xunit + ('²' if power == 2 else '')) if xunit else ''
+    return '·'.join(u for u in (yunit, xpart) if u)
+
+
+def _html_table(headers, rows):
+    """Compact HTML table (Qt rich-text) from a header list and a list of cell-
+    string rows; used for the info / fit-result panels."""
+    head = ''.join(f'<th style="padding:1px 8px;">{h}</th>' for h in headers)
+    body = ''.join('<tr>' + ''.join(f'<td style="padding:1px 8px;">{c}</td>'
+                                    for c in r) + '</tr>' for r in rows)
+    return f'<table style="border-collapse:collapse;"><tr>{head}</tr>{body}</table>'
+
+
+class MainWindow(QMainWindow):
+
+    def __init__(self, *args, **kwargs):
+        super(MainWindow, self).__init__(*args, **kwargs)
+
+        if len(sys.argv) > 1:
+            self.test_flag = sys.argv[1]
+        else:
+            self.test_flag = 'None'
+
+        self.opener = openfile.Saver_Opener()
+        self.bruker = bruker.Bruker_Opener()
+        self.fitter = fitting.math()
+        self.sp = sigproc.Signal_Processing()
+        self.fft = fft_module.Fast_Fourier()
+
+        # name -> {channel label: (x, y)} for every loaded file/trace; the trace
+        # selector picks one as active and self.datasets references its channels
+        # (so derived/promoted channels persist per trace)
+        self.traces = {}
+        # uname -> {channel label: (r,g,b)} preserved from "Load from plot" so a
+        # loaded curve keeps its exact on-screen colour (empty for file loads,
+        # which fall back to SOURCE_PENS / BATCH_COLORS)
+        self.trace_colors = {}
+        # channel-colour map of the *active* trace (set in _activate_trace)
+        self.active_colors = {}
+        # uname -> '#'-header lines of the file the trace came from (see header_view)
+        self.trace_headers = {}
+        self.trace_xnames = {}
+        self.header_window = None          # created on first use, then reused
+        # label -> (x, y) of the *active* trace's source curves
+        self.datasets = {}
+
+        # Current result. A result has a shared x-axis and one or two channels
+        # (e.g. FFT real + imaginary, or I/Q after smoothing).
+        self.result_x = None
+        self.result_channels = []      # list of (label, y-array)
+        self.result_xname = 'X'        # axis name pushed to the preview dock
+        self.result_show_source = True # overlay the source (same x-domain)?
+        # description lines written into the CSV header on save
+        self.result_meta = []
+        # residuals (data - fit) for the residuals dock; None hides that dock
+        self.result_residuals = None
+
+        # counter for naming chained "Result -> input" steps uniquely
+        self.step_counter = 0
+        self.fit_table = None              # last 'Fit all traces' parameter table
+        # persistent preview curves: label -> pyqtgraph PlotDataItem, reused via
+        # setData so live updates never tear down / rebuild plot items
+        self._curve_items = {}
+        # identity of what is currently plotted (curve labels + x-axis name); a
+        # change means a new result / view / unit, which re-fits the axes once.
+        self._plot_key = None
+        # set while promoting a result so selecting the new input does not
+        # immediately re-apply the operation to it
+        self._suppress_live = False
+        self.last_dir = _load_last_dir()   # start file dialogs in the last folder
+
+        self.design()
+        self.load_from_buffer(silent=True)
+        self._init_buffer_watch()          # auto-load new data while open
+
+    def _init_buffer_watch(self):
+        """Watch the buffer folder so a plot sent from the main GUI while this
+        window is already open is picked up automatically (no "Load from plot"
+        click needed). A short debounce lets the writer finish before we read;
+        the timer also coalesces the create/modify/delete burst into one load."""
+        self._buf_timer = QTimer(self)
+        self._buf_timer.setSingleShot(True)
+        self._buf_timer.setInterval(200)
+        self._buf_timer.timeout.connect(self._on_buffer_ready)
+        self._buf_watcher = QFileSystemWatcher(self)
+        watch_dir = os.path.dirname(BUFFER_PATH)
+        if os.path.isdir(watch_dir):
+            self._buf_watcher.addPath(watch_dir)
+        self._buf_watcher.directoryChanged.connect(lambda _p: self._buf_timer.start())
+
+    def _on_buffer_ready(self):
+        if os.path.isfile(BUFFER_PATH):
+            self.load_from_buffer(silent=True)
+
+    # ----------------------------------------------------------------- UI
+    def design(self):
+        self.setWindowTitle('Data Treatment')
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'gui', 'icon_treat.ico')
+        self.setWindowIcon(QIcon(icon_path))
+        self.setMinimumHeight(720)
+        self.setMinimumWidth(1040)
+        self.resize(1160, 800)
+        # background on the QMainWindow (as in awg_phasing_insys.py) rather than
+        # the central widget, so spinboxes keep their full native frame.
+        self.setStyleSheet(f"background-color: {BG};")
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setSpacing(gui_forms.PANEL_GAP)
+
+        # ---- Left: embedded live preview (in-process, smooth) ----
+        # Same plot stack as the main UI (atomize/main/widgets.py): a
+        # CrosshairPlotWidget inside a CloseableDock/DockArea, so the preview
+        # shares the crosshair, Shift-drag ruler and FFT/log right-click
+        # toggles. The dock can float, but its close button is hidden — the
+        # preview is the window's only plot and must not be dismissable.
+        pg.setConfigOptions(antialias=True)
+        self.plot_area = DockArea()
+        self.plot_widget = CrosshairPlotWidget()
+        # no setBackground: inherit pyqtgraph's global background (63,63,97, set
+        # in atomize/main/widgets.py) so 1D matches the 2D CrossSectionDock.
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.2)
+        self.legend = self.plot_widget.addLegend()
+        self.plot_dock = CloseableDock(name='Preview', widget=self.plot_widget)
+        self.plot_dock.close_button.hide()
+        self.plot_area.addDock(self.plot_dock)
+
+        # Residuals dock (data - fit), stacked below the preview and X-linked to
+        # it, à la deer_analysis. Hidden until a fit produces residuals; the zero
+        # line makes any structure (a curving/oscillating residual = wrong model
+        # shape) obvious at a glance, complementing the Durbin-Watson number.
+        self.resid_widget = CrosshairPlotWidget()
+        self.resid_widget.showGrid(x=True, y=True, alpha=0.2)
+        self.resid_widget.setXLink(self.plot_widget)
+        # legend so batch (Fit-all) residual traces can be told apart and each
+        # clicked to hide/show it — a single dominant trace otherwise compresses
+        # the shared y-scale so the rest are unreadable.
+        self.resid_legend = self.resid_widget.addLegend(offset=(-10, 10))
+        self.resid_zero = self.resid_widget.addLine(
+            y=0, pen=pg.mkPen((150, 150, 175), width=1, style=Qt.PenStyle.DashLine))
+        self._resid_item = None
+        self._batch_resid_items = {}       # per-trace residual curves ('Fit all')
+        self.resid_dock = CloseableDock(name='Residuals', widget=self.resid_widget)
+        self.resid_dock.close_button.hide()
+        self.plot_area.addDock(self.resid_dock, 'bottom', self.plot_dock)
+        self.resid_dock.hide()
+        # The X-link only works while both plots share the same X coordinate
+        # space, so the residuals must follow the preview's X-affecting display
+        # transforms (right-click ▸ Transforms). Log X and FFT remap X; mirror
+        # them onto the residuals plot. Log Y / derivative / subtract-mean touch
+        # only Y (which is NOT linked), so they need no mirroring.
+        main_ctrl = self.plot_widget.getPlotItem().ctrl
+        main_ctrl.logXCheck.toggled.connect(self._sync_resid_transforms)
+        main_ctrl.fftCheck.toggled.connect(self._sync_resid_transforms)
+        root.addWidget(self.plot_area, stretch=3)
+
+        # ---- Vertical separator between graph and controls ----
+        root.addWidget(gui_forms.vline())
+
+        # ---- Right: controls ----
+        panel = QVBoxLayout()
+        panel.setContentsMargins(*gui_forms.PANEL_MARGINS)
+        panel.setSpacing(8)
+        root.addLayout(panel, stretch=2)
+
+        # ---- Source group ----
+        src = FormPanel(field_width=gui_forms.FIELD_W,
+                        button_width=gui_forms.BTN_W)
+        src.add_heading('Source')
+        btn_open = QPushButton('Open CSV / HDF5…')
+        btn_open.setStyleSheet(BUTTON_STYLE)
+        btn_open.clicked.connect(self.open_csv)
+        btn_bruker = QPushButton('Open Bruker…')
+        btn_bruker.setStyleSheet(BUTTON_STYLE)
+        btn_bruker.clicked.connect(self.open_bruker)
+        btn_buf = QPushButton('Load from plot')
+        btn_buf.setStyleSheet(BUTTON_STYLE)
+        btn_buf.clicked.connect(lambda: self.load_from_buffer(silent=False))
+        btn_clear = QPushButton('Clear')
+        btn_clear.setStyleSheet(BUTTON_STYLE)
+        btn_clear.clicked.connect(self.clear_all)
+        # the file actions and the two rows under them share one 4-column grid,
+        # so Remove / Header… come out exactly as wide as Clear
+        src_grid = gui_forms.equal_grid(4)
+        for i, b in enumerate((btn_open, btn_bruker, btn_buf, btn_clear)):
+            src_grid.addWidget(b, 0, i)
+        src.add_layout(src_grid)
+
+        # trace selector: each opened file (or plot load) is one trace; the combo
+        # picks which one is active and feeds the channel selectors / operations.
+        self.trace_combo = QComboBox()
+        self.trace_combo.setStyleSheet(COMBO_STYLE)
+        self.trace_combo.setToolTip('Active trace. Open several files to compare; '
+                                    'each becomes a selectable trace here. Promoted '
+                                    'result channels stay with their trace.')
+        self.trace_combo.currentIndexChanged.connect(self._activate_trace)
+        self.trace_remove_btn = QPushButton('Remove')
+        self.trace_remove_btn.setStyleSheet(BUTTON_STYLE)
+        self.trace_remove_btn.setToolTip('Remove the active trace from the list.')
+        self.trace_remove_btn.clicked.connect(self._remove_trace)
+        trace_cell = QHBoxLayout()
+        trace_cell.setContentsMargins(0, 0, 0, 0)
+        trace_cell.setSpacing(8)
+        trace_cell.addWidget(gui_forms.label('Trace'))
+        trace_cell.addWidget(self.trace_combo, 1)
+        src_grid.addLayout(trace_cell, 1, 0, 1, 3)
+        src_grid.addWidget(gui_forms.row_button(self.trace_remove_btn), 1, 3)
+
+        # Name of the dataset currently loaded (file basename, or 'Loaded from
+        # plot' for the in-memory buffer). Kept on its own line so a long path
+        # wraps instead of stretching the panel.
+        self.loaded_label = QLabel('File: —')
+        self.loaded_label.setStyleSheet(LABEL_STYLE)
+        self.loaded_label.setWordWrap(True)
+        self.header_btn = QPushButton('Header…')
+        self.header_btn.setStyleSheet(BUTTON_STYLE)
+        self.header_btn.clicked.connect(self.show_header)
+        src_grid.addWidget(self.loaded_label, 2, 0, 1, 3)
+        src_grid.addWidget(self.header_btn, 2, 3)
+
+        self.i_combo = QComboBox()
+        self.i_combo.setStyleSheet(COMBO_STYLE)
+        self.i_combo.currentIndexChanged.connect(self.on_source_changed)
+        src.add_row('I / primary channel', self.i_combo, full=True)
+        self.q_combo = QComboBox()
+        self.q_combo.setStyleSheet(COMBO_STYLE)
+        self.q_combo.currentIndexChanged.connect(self.on_source_changed)
+        src.add_row('Q channel', self.q_combo, full=True)
+
+        self.pair_check = src.add_check(
+            'I/Q pair', tooltip='Run FFT / smoothing on both channels.')
+        self.pair_check.stateChanged.connect(self.on_source_changed)
+        # block the signal for the initial state: the rest of the UI (xname_edit,
+        # plot) is not built yet, so an on_source_changed -> redraw here would fail
+        self.pair_check.blockSignals(True)
+        self.pair_check.setChecked(True)
+        self.pair_check.blockSignals(False)
+
+        # X axis name (preview label / plot xname / CSV header for time-domain results)
+        self.xname_edit = QLineEdit('X')
+        self.xname_edit.setStyleSheet(LINEEDIT_STYLE)
+        self.xname_edit.textChanged.connect(lambda *_: self.redraw())
+        self.xname_edit.textEdited.connect(self._remember_xname)
+        src.add_row('X axis name', self.xname_edit, full=True)
+
+        self.live_check = gui_forms.live_update_checkbox()
+        src.add_widget(self.live_check)
+        panel.addWidget(src)
+
+        panel.addWidget(self._hline())
+
+        # ---- Operation tabs (the largest block) ----
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(ANALYSIS_TAB_STYLE)
+        self.tabs.addTab(self._build_fit_tab(), 'Fit')
+        self.tabs.addTab(self._build_fft_tab(), 'FFT')
+        self.tabs.addTab(self._build_phase_tab(), 'Phase')
+        self.tabs.addTab(self._build_smooth_tab(), 'Smooth / Baseline')
+        self.tabs.addTab(self._build_filter_tab(), 'Filter')
+        self.tabs.addTab(self._build_integrate_tab(), 'Integrate')
+        # Note: tab changes deliberately do NOT trigger _live_update. Re-running
+        # the new tab's op on switch is redundant and, after a "Result → input"
+        # chain, would re-transform an already-transformed input (e.g. FFT of an
+        # FFT). The preview recomputes only on a parameter change or Apply.
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        # Floor the tab strip at its full width so all tabs stay visible without
+        # the scroll arrows (the 6 tabs need ~441 px); the graph takes the rest.
+        self.tabs.setMinimumWidth(450)
+        panel.addWidget(self.tabs, stretch=1)
+
+        panel.addWidget(self._hline())
+
+        # ---- Output group ----
+        out = FormPanel(field_width=gui_forms.FIELD_W,
+                        button_width=gui_forms.BTN_W)
+        out.add_heading('Output')
+        self.name_edit = QLineEdit('treatment_result')
+        self.name_edit.setStyleSheet(LINEEDIT_STYLE)
+        out_grid = gui_forms.equal_grid(5)
+        out.add_layout(out_grid)
+        out_grid.addWidget(gui_forms.label('Result name'), 0, 0)
+        out_grid.addWidget(self.name_edit, 0, 1, 1, 4)
+        btn_plot = QPushButton('Plot to GUI')
+        btn_plot.setStyleSheet(BUTTON_STYLE)
+        btn_plot.clicked.connect(self.plot_result)
+        btn_save = QPushButton('Save…')
+        btn_save.setStyleSheet(BUTTON_STYLE)
+        btn_save.clicked.connect(self.save_result)
+        btn_chain = QPushButton('Result → input')
+        btn_chain.setStyleSheet(BUTTON_STYLE)
+        btn_chain.clicked.connect(self.promote_result)
+        btn_undo = QPushButton('Undo step')
+        btn_undo.setStyleSheet(BUTTON_STYLE)
+        btn_undo.setToolTip('Remove the most recently promoted step channel(s) '
+                            '(undo the last "Result → input") and reselect the '
+                            'previous input.')
+        btn_undo.clicked.connect(self.undo_step)
+        btn_clear_res = QPushButton('Clear result')
+        btn_clear_res.setStyleSheet(BUTTON_STYLE)
+        btn_clear_res.clicked.connect(self.clear_result)
+        btn_chain.setFixedHeight(btn_undo.sizeHint().height())
+        for i, b in enumerate((btn_plot, btn_save, btn_chain, btn_undo, btn_clear_res)):
+            out_grid.addWidget(b, 1, i)
+
+        # Hand the current curves off to Julia/Makie for a publication figure
+        # (vector PDF). Shells out to script_examples/makie/render.jl via QProcess.
+        # The mode selector picks what to draw: raw source, the result, or both
+        # overlaid (raw + fit on the same axes).
+        self.makie_mode = QComboBox()
+        self.makie_mode.addItems(['Raw + result', 'Result only', 'Raw only'])
+        self.makie_mode.setStyleSheet(COMBO_STYLE)
+        self.makie_mode.setToolTip('What to draw: raw source data, the computed '
+                                   'result, or both overlaid (e.g. fit over data).')
+        self.makie_btn = QPushButton('Makie figure…')
+        self.makie_btn.setStyleSheet(BUTTON_STYLE)
+        self.makie_btn.setToolTip('Render the selected curves to a publication-quality '
+                                  'PDF with Julia/Makie (first run precompiles).')
+        self.makie_btn.clicked.connect(self.make_makie_figure)
+        # Makie spans the last two of the five Output buttons above it
+        out_grid.addWidget(self.makie_mode, 2, 0, 1, 3)
+        out_grid.addWidget(gui_forms.row_button(self.makie_btn), 2, 3, 1, 2)
+
+        self.status = QLabel('Load a dataset to begin.')
+        self.status.setStyleSheet(LABEL_STYLE)
+        self.status.setWordWrap(True)
+        out.add_widget(self.status)
+        panel.addWidget(out)
+
+        gui_forms.apply_row_metrics(self)
+
+    def _hline(self):
+        return gui_forms.hline()
+
+    def _heading(self, text):
+        return gui_forms.heading(text)
+
+    def _label(self, text):
+        return gui_forms.label(text)
+
+    def _build_fit_tab(self):
+        p = FormPanel(field_width=gui_forms.FIELD_W,
+                      button_width=gui_forms.BTN_W)
+        self.model_combo = QComboBox()
+        self.model_combo.setStyleSheet(COMBO_STYLE)
+        self.model_combo.addItems(self.fitter.model_names())
+        self.model_combo.setCurrentText('Exponential')
+        # widest item is 'Stretched exponential + exponential'
+        p.add_row('Model', self.model_combo, full=True)
+        # live equation of the selected model, so the user sees what is fitted
+        self.fit_formula = QLabel('')
+        self.fit_formula.setStyleSheet(LABEL_STYLE)
+        self.fit_formula.setWordWrap(True)
+        self.fit_formula.setTextFormat(Qt.TextFormat.RichText)
+        self.model_combo.currentTextChanged.connect(self._update_fit_formula)
+        p.add_widget(self.fit_formula)
+        self.fit_no_offset = p.add_check(
+            'Fix offset = 0', tooltip='Drop the b / c baseline term of the model.')
+        self.fit_fix_beta = QCheckBox('Fix β =')
+        self.fit_fix_beta.setStyleSheet(CHECKBOX_STYLE)
+        self.fit_fix_beta.setToolTip('Hold the stretch exponent β at this value '
+                                     '(models with β only).')
+        self.fit_fix_beta.setFixedWidth(gui_forms.LABEL_COL_W - 6 + 8)
+        self.fit_beta = QDoubleSpinBox()
+        self.fit_beta.setStyleSheet(DSPIN_STYLE)
+        self.fit_beta.setRange(0.05, 5.0)
+        self.fit_beta.setDecimals(3)
+        self.fit_beta.setSingleStep(0.05)
+        self.fit_beta.setValue(1.0)
+        p.add_row(self.fit_fix_beta, self.fit_beta)
+        self._update_fit_formula(self.model_combo.currentText())
+        adv = p.add_advanced()
+        adv.field_width, adv.button_width = gui_forms.FIELD_W, gui_forms.BTN_W
+        self.fit_drop_start = QSpinBox()
+        self.fit_drop_end = QSpinBox()
+        for label, spin in (('Drop start points', self.fit_drop_start),
+                            ('Drop end points', self.fit_drop_end)):
+            spin.setStyleSheet(SPIN_STYLE)
+            spin.setRange(0, 1000000)
+            spin.setSuffix(' pts')
+            spin.setToolTip(
+                f'{label} from each curve before fitting (in stored point order). '
+                'Applies to Fit and Fit all traces; source data is preserved.')
+            adv.add_row(label, spin)
+        btn = QPushButton('Fit')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.setToolTip(self._FIT_STATS_TOOLTIP)
+        btn.clicked.connect(self.do_fit)
+        self.fit_all_btn = QPushButton('Fit all traces')
+        self.fit_all_btn.setStyleSheet(BUTTON_STYLE)
+        self.fit_all_btn.setToolTip(
+            'Fit the selected model to the I channel of every loaded trace, overlay '
+            'the data + fits, and build a per-trace parameter table (Save table…).')
+        self.fit_all_btn.clicked.connect(self.fit_all_traces)
+        self.fit_save_table_btn = QPushButton('Save table…')
+        self.fit_save_table_btn.setStyleSheet(BUTTON_STYLE)
+        self.fit_save_table_btn.setToolTip('Save the per-trace fit parameters as CSV.')
+        self.fit_save_table_btn.clicked.connect(self.save_fit_table)
+        self.fit_save_table_btn.setEnabled(False)
+        p.add_button_row(btn, self.fit_all_btn, self.fit_save_table_btn)
+        self.fit_result = QLabel('')
+        self.fit_result.setStyleSheet(LABEL_STYLE)
+        self.fit_result.setWordWrap(True)
+        self.fit_result.setTextFormat(Qt.TextFormat.RichText)
+        self.fit_result.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        # scroll the parameter readout (the ESEEM models list up to 12 params)
+        fit_scroll = QScrollArea()
+        fit_scroll.setStyleSheet(SCROLL_STYLE)
+        fit_scroll.setWidgetResizable(True)
+        fit_scroll.setWidget(self.fit_result)
+        p.set_row_stretch(p.add_row(None, fit_scroll), 1)
+        return gui_forms.scroll_wrap(p)
+
+    WINDOWS = ['None', 'Hann', 'Hamming', 'Blackman', 'Bartlett', 'Flat-top',
+               'Kaiser', 'Gaussian', 'Tukey']
+    FILTERS = ['None', 'Low-pass', 'High-pass', 'Band-pass']
+
+    # parametric windows: name -> (label, min, max, decimals, default, step)
+    WINDOW_PARAM = {
+        'Kaiser':   ('Kaiser β', 0.0, 100.0, 2, 8.6, 0.5),
+        'Gaussian': ('Gaussian σ (×N)', 0.01, 1.0, 3, 0.15, 0.01),
+        'Tukey':    ('Tukey α', 0.0, 1.0, 3, 0.5, 0.05),
+    }
+
+    def _build_fft_tab(self):
+        p = FormPanel(field_width=gui_forms.FIELD_W,
+                      button_width=gui_forms.BTN_W)
+        p.add_title('Complex FFT with apodization and zero fill', help=_HELP_FFT)
+
+        self.fft_mode = QComboBox()
+        self.fft_mode.setStyleSheet(COMBO_STYLE)
+        self.fft_mode.addItems(['Magnitude', 'Real', 'Imaginary', 'Real + Imaginary'])
+        self.fft_mode.currentIndexChanged.connect(self._live_update)
+        p.add_row('Output', self.fft_mode)
+
+        self.fft_window = QComboBox()
+        self.fft_window.setStyleSheet(COMBO_STYLE)
+        self.fft_window.addItems(self.WINDOWS)
+        # relabel/enable the parameter field first, then recompute
+        self.fft_window.currentIndexChanged.connect(self._update_window_param)
+        self.fft_window.currentIndexChanged.connect(self._live_update)
+        p.add_row('Window', self.fft_window)
+
+        self.fft_zerofill = QComboBox()
+        self.fft_zerofill.setStyleSheet(COMBO_STYLE)
+        self.fft_zerofill.addItems(['None', '×2', '×4', '×8', 'Next pow₂'])
+        self.fft_zerofill.setCurrentText('×4')
+        self.fft_zerofill.currentIndexChanged.connect(self._live_update)
+        p.add_row('Zero fill', self.fft_zerofill)
+
+        self.fft_skip = QSpinBox()
+        self.fft_skip.setStyleSheet(SPIN_STYLE)
+        self.fft_skip.setRange(0, 1000000)
+        self.fft_skip.setSuffix(' pts')
+        self.fft_skip.setToolTip(
+            'Number of leading <b>points</b> (samples, not time) to drop so the '
+            'transform starts at the echo centre.')
+        self.fft_skip.valueChanged.connect(self._live_update)
+        btn_auto = QPushButton('Auto')
+        btn_auto.setStyleSheet(BUTTON_STYLE)
+        btn_auto.setToolTip(
+            'Estimate the echo centre and fill "skip pts" with its <b>point '
+            'index</b> (a sample number, not a time).<br><br>'
+            'Found from the magnitude envelope |I+iQ| (I/Q pair) or |I|: the '
+            'peak sample, refined by a centre-of-mass over the symmetric core '
+            'around it (so a slow one-sided FID decay tail does not drag it off '
+            'the peak).<br><br>'
+            'Always sanity-check against the plot; type the point in by hand if '
+            'a noisy record needs it.')
+        btn_auto.clicked.connect(self.auto_echo_center)
+        p.add_row('Echo center', self.fft_skip, btn_auto, stretch=[3, 1])
+
+        adv = p.add_advanced()
+        adv.field_width, adv.button_width = gui_forms.FIELD_W, gui_forms.BTN_W
+
+        self.fft_winparam = QDoubleSpinBox()
+        self.fft_winparam.setStyleSheet(DSPIN_STYLE)
+        self.fft_winparam.setRange(0.0, 100.0)
+        self.fft_winparam.setDecimals(2)
+        self.fft_winparam.setValue(8.6)
+        self.fft_winparam.setEnabled(False)   # 'None' is selected initially
+        self.fft_winparam.valueChanged.connect(self._live_update)
+        wp_row = adv.add_row('Window param', self.fft_winparam)
+        self.fft_winparam_label = adv.grid.itemAtPosition(wp_row, 0).widget()
+        self.fft_winparam_label.setVisible(False)
+        self.fft_winparam.setVisible(False)
+
+        self.fft_filter = QComboBox()
+        self.fft_filter.setStyleSheet(COMBO_STYLE)
+        self.fft_filter.addItems(self.FILTERS)
+        self.fft_filter.currentIndexChanged.connect(self._live_update)
+        adv.add_row('Passband', self.fft_filter)
+
+        self.fft_cut_lo = QDoubleSpinBox()
+        self.fft_cut_lo.setStyleSheet(DSPIN_STYLE)
+        self.fft_cut_lo.setRange(0.0, 1.0)
+        self.fft_cut_lo.setSingleStep(0.01)
+        self.fft_cut_lo.setDecimals(4)
+        self.fft_cut_lo.setSuffix(' ×f_max')
+        self.fft_cut_lo.valueChanged.connect(self._live_update)
+        adv.add_row('Low cutoff', self.fft_cut_lo)
+
+        self.fft_cut_hi = QDoubleSpinBox()
+        self.fft_cut_hi.setStyleSheet(DSPIN_STYLE)
+        self.fft_cut_hi.setRange(0.0, 1.0)
+        self.fft_cut_hi.setSingleStep(0.01)
+        self.fft_cut_hi.setDecimals(4)
+        self.fft_cut_hi.setSuffix(' ×f_max')
+        self.fft_cut_hi.setValue(1.0)
+        self.fft_cut_hi.valueChanged.connect(self._live_update)
+        adv.add_row('High cutoff', self.fft_cut_hi)
+
+        btn = QPushButton('Compute FFT')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_fft)
+        p.add_button_row(btn, width=gui_forms.ACTION_W)
+        p.add_stretch()
+
+        return gui_forms.scroll_wrap(p)
+
+    def _build_filter_tab(self):
+        p = FormPanel(field_width=gui_forms.FIELD_W,
+                      button_width=gui_forms.BTN_W)
+        p.add_title('Zero the frequencies outside the passband', help=_HELP_FILTER)
+
+        self.filt_type = QComboBox()
+        self.filt_type.setStyleSheet(COMBO_STYLE)
+        self.filt_type.addItems(['Low-pass', 'High-pass', 'Band-pass'])
+        self.filt_type.currentIndexChanged.connect(self._live_update)
+        p.add_row('Type', self.filt_type)
+
+        self.filt_cut_lo = QDoubleSpinBox()
+        self.filt_cut_lo.setStyleSheet(DSPIN_STYLE)
+        self.filt_cut_lo.setRange(0.0, 1.0)
+        self.filt_cut_lo.setSingleStep(0.01)
+        self.filt_cut_lo.setDecimals(4)
+        self.filt_cut_lo.setSuffix(' ×f_max')
+        self.filt_cut_lo.setValue(0.1)
+        self.filt_cut_lo.valueChanged.connect(self._live_update)
+        p.add_row('Low cutoff', self.filt_cut_lo)
+
+        self.filt_cut_hi = QDoubleSpinBox()
+        self.filt_cut_hi.setStyleSheet(DSPIN_STYLE)
+        self.filt_cut_hi.setRange(0.0, 1.0)
+        self.filt_cut_hi.setSingleStep(0.01)
+        self.filt_cut_hi.setDecimals(4)
+        self.filt_cut_hi.setSuffix(' ×f_max')
+        self.filt_cut_hi.setValue(0.5)
+        self.filt_cut_hi.valueChanged.connect(self._live_update)
+        p.add_row('High cutoff', self.filt_cut_hi)
+
+        btn = QPushButton('Apply filter')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_filter)
+        p.add_button_row(btn, width=gui_forms.ACTION_W)
+        p.add_stretch()
+        return gui_forms.scroll_wrap(p)
+
+    def _build_phase_tab(self):
+        p = FormPanel(field_width=gui_forms.FIELD_W,
+                      button_width=gui_forms.BTN_W)
+        p.add_title('Phase correction in time or frequency', help=_HELP_PHASE)
+        self.phase_mode = QComboBox()
+        self.phase_mode.setStyleSheet(COMBO_STYLE)
+        self.phase_mode.addItems(['Time-domain', 'Frequency-domain'])
+        self.phase_mode.setToolTip('Follows the selected input axis units when the input changes.')
+        p.add_row('Mode', self.phase_mode)
+
+        def spin(suffix, decimals=3, step=0.05, zero=False):
+            box = QDoubleSpinBox()
+            box.setStyleSheet(DSPIN_STYLE)
+            box.setRange(0.0 if zero else -1e6, 360.0 if zero else 1e6)
+            box.setDecimals(decimals)
+            box.setSingleStep(step)
+            box.setSuffix(suffix)
+            box.setWrapping(zero)
+            box.valueChanged.connect(self._live_update)
+            return box
+
+        def auto_button(slot, tooltip):
+            button = QPushButton('Auto')
+            button.setStyleSheet(BUTTON_STYLE)
+            button.setToolTip(tooltip)
+            button.clicked.connect(slot)
+            return button
+
+        self.phase_time_panel = tp = FormPanel(field_width=gui_forms.FIELD_W,
+                                              button_width=gui_forms.BTN_W)
+        self.phase_zero = spin(' deg', 2, 0.5, zero=True)
+        tp.add_row('Constant phase', self.phase_zero,
+                   auto_button(self.auto_phase_zero,
+                               'Estimate the constant phase over the echo after the frequency shift.'))
+        self.phase_first = spin(' MHz')
+        tp.add_row('Frequency shift', self.phase_first,
+                   auto_button(self.auto_phase_first,
+                               'Cancel the carrier, refine the shift over the echo, then set zero order.'),
+                   tooltip='Positive values move the carrier toward higher frequency; time units come from the X axis.')
+        p.add_widget(tp)
+
+        self.phase_freq_panel = fp = FormPanel(field_width=gui_forms.FIELD_W,
+                                              button_width=gui_forms.BTN_W)
+        self.phase_freq_zero = spin(' deg', 2, 0.5, zero=True)
+        fp.add_row('Zero order', self.phase_freq_zero,
+                   auto_button(self.auto_phase_zero,
+                               'Estimate the spectral constant phase with first and second order already applied.'))
+        self.phase_freq_first = spin(' deg/MHz')
+        fp.add_row('First order', self.phase_freq_first,
+                   tooltip='Phase slope about the pivot frequency.')
+        adv = fp.add_advanced()
+        adv.field_width, adv.button_width = gui_forms.FIELD_W, gui_forms.BTN_W
+        self.phase_freq_second = spin(' deg/MHz²', 4, 0.001)
+        adv.add_row('Second order', self.phase_freq_second,
+                    tooltip='Quadratic phase coefficient about the pivot frequency.')
+        self.phase_pivot = spin(' MHz')
+        adv.add_row('Pivot frequency', self.phase_pivot,
+                    tooltip='Frequency at which zero-order phase is defined.')
+        p.add_widget(fp)
+        fp.hide()
+        self.phase_mode.currentIndexChanged.connect(self._phase_mode_changed)
+
+        self.phase_out = QComboBox()
+        self.phase_out.setStyleSheet(COMBO_STYLE)
+        self.phase_out.addItems(['Real', 'Imaginary', 'Magnitude', 'Real + Imaginary'])
+        self.phase_out.setCurrentText('Real + Imaginary')
+        self.phase_out.currentIndexChanged.connect(self._live_update)
+        p.add_row('Output', self.phase_out)
+        btn = QPushButton('Apply correction')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_phase)
+        p.add_button_row(btn, width=gui_forms.ACTION_W)
+        p.add_stretch()
+        return gui_forms.scroll_wrap(p)
+
+    def _phase_mode_changed(self, *args):
+        spectral = self.phase_mode.currentIndex() == 1
+        self.phase_time_panel.setVisible(not spectral)
+        self.phase_freq_panel.setVisible(spectral)
+        self._reset_result()
+        self.redraw()
+        self._live_update()
+
+    def _sync_phase_mode(self):
+        """Follow recognized input units without recalculating or clearing a result."""
+        unit = _split_unit(self._xname())[1]
+        for mode, convert in enumerate((fft_module.time_axis_ns, fft_module.frequency_axis_mhz)):
+            try:
+                convert(0, unit)
+            except ValueError:
+                continue
+            blocked = self.phase_mode.blockSignals(True)
+            self.phase_mode.setCurrentIndex(mode)
+            self.phase_mode.blockSignals(blocked)
+            self.phase_time_panel.setVisible(mode == 0)
+            self.phase_freq_panel.setVisible(mode == 1)
+            return
+
+    def _build_smooth_tab(self):
+        p = FormPanel(field_width=gui_forms.FIELD_W,
+                      button_width=gui_forms.BTN_W)
+        p.add_title('Smooth, subtract a baseline or normalize', help=_HELP_SMOOTH)
+
+        self.smooth_method = QComboBox()
+        self.smooth_method.setStyleSheet(COMBO_STYLE)
+        self.smooth_method.addItems(['Savitzky-Golay', 'Moving average',
+            'Baseline subtract', 'Normalize'])
+        self.smooth_method.setCurrentText('Baseline subtract')
+        self.smooth_method.currentIndexChanged.connect(self._live_update)
+        p.add_row('Method', self.smooth_method)
+
+        self.smooth_window = QSpinBox()
+        self.smooth_window.setStyleSheet(SPIN_STYLE)
+        self.smooth_window.setRange(1, 99999)
+        self.smooth_window.setValue(11)
+        self.smooth_window.valueChanged.connect(self._live_update)
+        p.add_row('Window / order', self.smooth_window)
+
+        self.smooth_order = QSpinBox()
+        self.smooth_order.setStyleSheet(SPIN_STYLE)
+        self.smooth_order.setRange(0, 20)
+        self.smooth_order.setValue(3)
+        self.smooth_order.valueChanged.connect(self._live_update)
+        p.add_row('Poly order', self.smooth_order)
+
+        self.base_region = QComboBox()
+        self.base_region.setStyleSheet(COMBO_STYLE)
+        self.base_region.addItems(['All points', 'First N points', 'Last N points',
+                                   'First & last N'])
+        self.base_region.currentIndexChanged.connect(self._live_update)
+        p.add_row('Baseline from', self.base_region)
+
+        self.base_npts = QSpinBox()
+        self.base_npts.setStyleSheet(SPIN_STYLE)
+        self.base_npts.setRange(1, 99999)
+        self.base_npts.setValue(20)
+        self.base_npts.setSuffix(' pts')
+        self.base_npts.valueChanged.connect(self._live_update)
+        p.add_row('N points', self.base_npts)
+
+        btn = QPushButton('Apply')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_smooth)
+        p.add_button_row(btn, width=gui_forms.ACTION_W)
+        p.add_stretch()
+        return gui_forms.scroll_wrap(p)
+
+    def _build_integrate_tab(self):
+        p = FormPanel(field_width=gui_forms.FIELD_W,
+                      button_width=gui_forms.BTN_W)
+        p.add_title('Integrate a spectrum, e.g. a CW EPR derivative', help=_HELP_INTEGRATE)
+
+        self.int_output = QComboBox()
+        self.int_output.setStyleSheet(COMBO_STYLE)
+        self.int_output.addItems(['First integral', 'Double integral'])
+        self.int_output.currentIndexChanged.connect(self._live_update)
+        p.add_row('Output', self.int_output)
+
+        self.int_base_check = p.add_check(
+            'Absorption baseline from ends', checked=True,
+            tooltip='Subtract a straight line through the first and last N points '
+                    'of the first integral before the second integration.')
+        self.int_base_check.stateChanged.connect(self._live_update)
+
+        self.int_npts = QSpinBox()
+        self.int_npts.setStyleSheet(SPIN_STYLE)
+        self.int_npts.setRange(1, 99999)
+        self.int_npts.setValue(20)
+        self.int_npts.setSuffix(' pts')
+        self.int_npts.valueChanged.connect(self._live_update)
+        p.add_row('N points', self.int_npts,
+                  tooltip='Points at each end of the window taken as line-free.')
+
+        self.int_from, self.int_to = QDoubleSpinBox(), QDoubleSpinBox()
+        for spin in (self.int_from, self.int_to):
+            spin.setStyleSheet(DSPIN_STYLE)
+            spin.setRange(-1e12, 1e12)
+            spin.setDecimals(4)
+            spin.setValue(0.0)
+            spin.valueChanged.connect(self._live_update)
+        p.add_row('X window from / to', self.int_from, self.int_to,
+                  tooltip='In X-axis units; From = To integrates the whole trace.')
+
+        btn = QPushButton('Apply')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_integrate)
+        p.add_button_row(btn, width=gui_forms.ACTION_W)
+
+        self.int_result = QLabel('')
+        self.int_result.setStyleSheet(LABEL_STYLE)
+        self.int_result.setWordWrap(True)
+        self.int_result.setTextFormat(Qt.TextFormat.RichText)
+        p.add_widget(self.int_result)
+        p.add_stretch()
+        return gui_forms.scroll_wrap(p)
+
+    # ------------------------------------------------------------- loading
+    def _unique_trace_name(self, name):
+        """A trace name not already in use (append (2), (3), … on collision)."""
+        name = name or 'trace'
+        if name not in self.traces:
+            return name
+        i = 2
+        while f'{name} ({i})' in self.traces:
+            i += 1
+        return f'{name} ({i})'
+
+    def _add_traces(self, items, colors=None, headers=None):
+        """Register one or more (name, channel-mapping) traces and make the last
+        one active. `items` is a list of (name, {label: (x, y)}). `colors`, when
+        given, is a {channel label: (r,g,b)} map (from "Load from plot") whose
+        entries are kept per trace so each channel draws in its original colour.
+        `headers`, when given, is a list of '#'-header line lists parallel to
+        `items`, stored per trace for the header viewer. Returns the names the
+        traces were registered under."""
+        added = []
+        for idx, (name, mapping) in enumerate(items):
+            if not mapping:
+                continue
+            uname = self._unique_trace_name(name)
+            self.traces[uname] = dict(mapping)
+            xname = self._xname()
+            if headers and idx < len(headers):
+                labels = self._csv_header_labels(headers[idx])
+                if labels and labels[0]:
+                    xname = labels[0]
+            self.trace_xnames[uname] = {label: xname for label in mapping}
+            if colors:
+                tc = {lbl: colors[lbl] for lbl in mapping if lbl in colors}
+                if tc:
+                    self.trace_colors[uname] = tc
+            if headers and idx < len(headers) and headers[idx]:
+                self.trace_headers[uname] = headers[idx]
+            added.append(uname)
+        if not added:
+            return added
+        self.trace_combo.blockSignals(True)
+        self.trace_combo.addItems(added)
+        self.trace_combo.setCurrentIndex(self.trace_combo.count() - 1)
+        self.trace_combo.blockSignals(False)
+        self._activate_trace()                     # show the newly added trace
+        return added
+
+    def _activate_trace(self, *args):
+        """Make the selected trace active: point self.datasets at its channels and
+        rebuild the I/Q selectors (the per-load workflow reset).
+
+        self.datasets references the stored trace dict (not a copy) so promoted
+        result channels stay with their trace when switching back and forth."""
+        name = self.trace_combo.currentText()
+        # Opening/switching data resets the workflow: turn off live update so the
+        # trace is shown as-is, not reprocessed by leftover tab parameters.
+        self.live_check.setChecked(False)
+        shift = header_frequency_shift(self.trace_headers.get(name, []))
+        self.phase_first.setValue(0.0 if shift is None else shift)
+        self.datasets = self.traces.get(name, {})
+        self.active_colors = self.trace_colors.get(name, {})
+        keys = list(self.datasets)
+        self._refresh_combos(select_i=keys[0] if keys else None,
+                             select_q=keys[1] if len(keys) > 1 else None)
+        if name:
+            self._set_loaded_file(f'{name}  ({self.trace_combo.currentIndex() + 1} '
+                                  f'of {self.trace_combo.count()})')
+        if self.header_window is not None:         # the viewer follows the panel
+            self.header_window.select(name)
+
+    def _remove_trace(self):
+        """Drop the active trace; activate the next one, or clear if none remain."""
+        name = self.trace_combo.currentText()
+        if not name:
+            return
+        self.traces.pop(name, None)
+        self.trace_colors.pop(name, None)
+        self.trace_headers.pop(name, None)
+        self.trace_xnames.pop(name, None)
+        idx = self.trace_combo.currentIndex()
+        self.trace_combo.blockSignals(True)
+        self.trace_combo.removeItem(idx)
+        self.trace_combo.blockSignals(False)
+        if self.trace_combo.count():
+            self.trace_combo.setCurrentIndex(min(idx, self.trace_combo.count() - 1))
+            self._activate_trace()
+            self._sync_header_window()
+            self.set_status(f'Removed trace "{name}".')
+        else:
+            self.clear_all()
+
+    # ------------------------------------------------------- header viewer
+    def _sync_header_window(self):
+        """Push the current traces (and their stored headers) into the viewer.
+        A load never opens the window by itself — only the 'Header…' button does."""
+        if self.header_window is None:
+            return                         # nothing open: nothing to keep in sync
+        sources = [(name, self.trace_headers.get(name, []))
+                   for name in self.traces]
+        self.header_window.set_sources(sources,
+                                       active=self.trace_combo.currentText())
+
+    def show_header(self):
+        """'Header…' button: open (or raise) the viewer on the active trace."""
+        if self.header_window is None:
+            self.header_window = HeaderWindow(self)
+        self._sync_header_window()
+        if not self.traces:
+            self.set_status('No dataset loaded — nothing to show a header for.')
+        self.header_window.show_source(self.trace_combo.currentText())
+
+    def _refresh_combos(self, select_i=None, select_q=None):
+        """Repopulate the I/Q selectors from self.datasets without discarding it."""
+        keys = list(self.datasets.keys())
+        for combo, sel in ((self.i_combo, select_i), (self.q_combo, select_q)):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(keys)
+            if sel is not None and sel in self.datasets:
+                combo.setCurrentIndex(keys.index(sel))
+            combo.blockSignals(False)
+        self.on_source_changed()
+
+    @staticmethod
+    def _csv_header_labels(header_lines):
+        """Column labels from a CSV's '#'-comment header (as read by
+        header_view.read_header), e.g. '# Time (ns), Signal (V)' ->
+        ['Time (ns)', 'Signal (V)']. Uses the last comment line before the data
+        (the column-name row, by convention) and splits on commas; decorative
+        '#'-only lines are ignored. Returns [] when there is nothing usable."""
+        labels = []
+        for line in header_lines:
+            parts = [c.strip() for c in line.split(',')]
+            if any(parts):
+                labels = parts
+        return labels if any(labels) else []      # never block a load over a bad header
+
+    def _remember_dir(self, path):
+        """Record the folder of `path` as the next dialog's starting directory."""
+        self.last_dir = os.path.dirname(path) or self.last_dir
+        _save_last_dir(self.last_dir)
+
+    def _open_dialog(self, multiple=False, **kw):
+        result = self.opener.open_file_dialog(multiprocessing=True,
+                                              directory=self.last_dir,
+                                              multiple=multiple, **kw)
+        if multiple:
+            paths = [p for p in (result or []) if p and p != 'None']
+            if paths:
+                self._remember_dir(paths[0])
+            return paths
+        if result and result != 'None':
+            self._remember_dir(result)
+        return result
+
+    def _save_dialog(self, name_filters=('CSV (*.csv)',)):
+        path = self.opener.FileDialog(directory=self.last_dir, mode='Save',
+                                      name_filters=name_filters)
+        if not path:
+            return None
+        exts = [e for f in name_filters for e in re.findall(r'\*(\.\w+)', f)]
+        if not path.lower().endswith(tuple(exts)):
+            path += re.search(r'\*(\.\w+)', self.opener.dialog.selectedNameFilter()).group(1)
+        self.opener.save_cancelled = False
+        self._remember_dir(path)
+        return path
+
+    def _csv_to_mapping(self, file_path, header_lines):
+        """Read a CSV into a {channel label: (x, y)} mapping plus its column
+        labels, taken from the already-read `header_lines`. Raises ValueError on
+        a structurally unusable file.
+
+        Guards against accidentally loading a 2D matrix: open_1d gives one row per
+        CSV column, so a [trace × point] dataset arrives as hundreds/thousands of
+        "curves". The 1D tool is for a handful of columns (X + a few channels);
+        wide files belong in the 2D tool."""
+        _, data = self.opener.open_1d(file_path)
+        data = np.atleast_2d(data)
+        if data.shape[0] < 2:
+            raise ValueError('needs at least two columns (X and Y)')
+        if data.shape[0] > 6:
+            raise ValueError(f'looks like a 2D dataset ({data.shape[0]} columns); '
+                             f'use the 2D tool')
+        x = data[0]
+        labels = self._csv_header_labels(header_lines)
+        mapping = {}
+        for i in range(1, data.shape[0]):
+            y = data[i]
+            mask = ~(np.isnan(x) | np.isnan(y))
+            name = labels[i] if (i < len(labels) and labels[i]) else f'Y{i}'
+            while name in mapping:                 # keep the dataset keys unique
+                name += "'"
+            mapping[name] = (x[mask], y[mask])
+        return mapping, labels
+
+    def open_csv(self):
+        paths = self._open_dialog(multiple=True,
+                                  name_filters=['Data (*.csv *.h5)', 'All files (*)'])
+        if not paths:
+            return
+        items, headers, failed, xname = [], [], [], None
+        for file_path in paths:
+            header_lines = read_header(file_path)   # one read: labels + viewer
+            try:
+                mapping, labels = self._csv_to_mapping(file_path, header_lines)
+            except Exception as e:
+                failed.append(f'{os.path.basename(file_path)} ({e})')
+                continue
+            # axis name + unit from the first file's X-column header (col 0)
+            if xname is None and labels and labels[0]:
+                xname = labels[0]
+            items.append((os.path.splitext(os.path.basename(file_path))[0], mapping))
+            headers.append(header_lines)
+        if xname:
+            self.xname_edit.setText(xname)
+        if items:
+            self._add_traces(items, headers=headers)
+            self._sync_header_window()
+        msg = f'Loaded {len(items)} trace(s)' if items else 'No traces loaded'
+        if failed:
+            msg += '. Skipped: ' + '; '.join(failed)
+        shift = header_frequency_shift(self.trace_headers.get(self.trace_combo.currentText(), []))
+        if items and shift:
+            msg += (f'. Frequency shift {shift:g} MHz set from the file header — '
+                    f'Phase tab → Apply correction to demodulate')
+        self.set_status(msg + '.')
+
+    def open_bruker(self):
+        """Load a Bruker native dataset (BES3T .DSC/.DTA or ESP/WinEPR .par/.spc).
+        Complex traces register as a real+imag I/Q pair."""
+        nf = ['Bruker (*.DSC *.dsc *.DTA *.dta *.par *.spc *.PAR *.SPC)',
+              'BES3T (*.DSC *.dsc *.DTA *.dta)',
+              'ESP/WinEPR (*.par *.spc *.PAR *.SPC)', 'All files (*)']
+        file_path = self._open_dialog(name_filters=nf)
+        if not file_path or file_path == 'None':
+            return
+        try:
+            res = self.bruker.open(file_path)
+        except Exception as e:
+            self.set_status(f'Could not read Bruker file: {e}')
+            return
+        if res['ndim'] != 1:
+            self.set_status(f'{res["format"]} {res["ndim"]}D dataset '
+                            f'({res["data"].shape}) — the 1D tool needs a 1D trace; '
+                            f'use the 2D Data Treatment window.')
+            return
+        x = np.asarray(res['x'], dtype=float)
+        mapping = {lbl: (x, np.asarray(y, dtype=float)) for lbl, y in res['channels']}
+        unit = f' ({res["x_unit"]})' if res['x_unit'] else ''
+        self.xname_edit.setText(f'{res["x_name"]}{unit}')
+        self._add_traces([(os.path.splitext(os.path.basename(file_path))[0], mapping)],
+                         headers=[params_to_lines(res.get('params', {}))])
+        self._sync_header_window()
+        if res['complex']:                        # selects first two as I / Q
+            self.pair_check.setChecked(True)
+        self.set_status(f'Loaded {os.path.basename(file_path)} — {res["format"]}, '
+                        f'{len(x)} pts, '
+                        + ('complex (I/Q pair).' if res['complex'] else 'real.'))
+
+    @staticmethod
+    def _parse_rgb(token):
+        """'r,g,b' -> (int, int, int), or None if blank/malformed."""
+        try:
+            r, g, b = (int(v) for v in token.split(','))
+            return (r, g, b)
+        except Exception:
+            return None
+
+    def load_from_buffer(self, silent=False):
+        if not os.path.isfile(BUFFER_PATH):
+            if not silent:
+                self.set_status('No plot buffer found. Right-click a plot in the '
+                                'main window → "Send to Data Treatment" first.')
+            return
+        try:
+            labels = []
+            color_tokens = []
+            buf_xname = ''
+            header_count = 0
+            with open(BUFFER_PATH, 'r') as fh:
+                for line in fh:
+                    if not line.startswith('#'):
+                        break
+                    header_count += 1
+                    if 'labels:' in line:
+                        labels = line.split('labels:', 1)[1].strip().split('|')
+                    elif 'colors:' in line:
+                        color_tokens = line.split('colors:', 1)[1].strip().split('|')
+                    elif 'xname:' in line:
+                        buf_xname = line.split('xname:', 1)[1].strip()
+            data = np.genfromtxt(BUFFER_PATH, delimiter=',', skip_header=header_count)
+            data = np.atleast_2d(data)
+            # The buffer is a one-shot mailbox: consume it now so that closing
+            # and reopening the window does NOT reload this (stale) plot data.
+            # A fresh "Send to Data Treatment" rewrites it.
+            self._consume_buffer()
+            # buffer columns are interleaved x0, y0, x1, y1, ...
+            ncurves = data.shape[1]//2
+            curves = []
+            curve_colors = {}
+            for i in range(ncurves):
+                x = data[:, 2*i]
+                y = data[:, 2*i + 1]
+                mask = ~(np.isnan(x) | np.isnan(y))
+                label = labels[i] if i < len(labels) else f'curve {i}'
+                curves.append((label, (x[mask], y[mask])))
+                if i < len(color_tokens):
+                    rgb = self._parse_rgb(color_tokens[i])
+                    if rgb is not None:
+                        curve_colors[label] = rgb
+
+            # Group the curves into traces so BOTH workflows work from one plot:
+            #   * a bunch of independent I-channels  -> one trace each ("Fit all")
+            #   * an I/Q pair                         -> one trace, two channels
+            # The main window names companion channels of a multi-curve plot
+            # "<base>_1", "<base>_2", ... (see widgets.py). So "<base>_k" is an
+            # extra channel of "<base>" ONLY when a curve named exactly "<base>"
+            # is also present; otherwise (e.g. a "field_100"/"field_200" series)
+            # it stays its own trace.
+            present = {lbl for lbl, _ in curves}
+            items = []            # (trace name, {channel label: (x, y)})
+            index = {}            # base trace name -> position in items
+            for label, xy in curves:
+                m = re.match(r'^(.+)_(\d+)$', label)
+                base = m.group(1) if (m and m.group(1) in present) else None
+                if base is not None and base in index:
+                    items[index[base]][1][label] = xy      # companion channel
+                else:
+                    index[label] = len(items)
+                    items.append((label, {label: xy}))
+            if not items:
+                if not silent:
+                    self.set_status('Plot buffer is empty.')
+                return
+            # name+unit of the X axis (e.g. a 2D slice's decay axis); lets the
+            # preview SI-prefix a 's' axis to ns. Set before registering so the
+            # first redraw already uses it.
+            if buf_xname:
+                self.xname_edit.setText(buf_xname)
+            self._add_traces(items, colors=curve_colors)
+            self._sync_header_window()   # plot buffer carries no parameter header
+            # if the active (last) trace came in as an I/Q pair, treat both
+            # channels together for FFT / smoothing, as the Bruker-complex load does
+            if len(items[-1][1]) > 1:
+                self.pair_check.setChecked(True)
+            nchan = sum(len(m) for _, m in items)
+            extra = '' if nchan == len(items) else f' ({nchan} channels)'
+            self.set_status(f'Loaded {len(items)} trace(s){extra} from the current plot.')
+        except Exception as e:
+            self._consume_buffer()   # drop a malformed buffer so it doesn't recur
+            if not silent:
+                self.set_status(f'Could not read plot buffer: {e}')
+
+    def _consume_buffer(self):
+        """Delete the plot buffer file once read (one-shot mailbox semantics)."""
+        try:
+            if os.path.isfile(BUFFER_PATH):
+                os.remove(BUFFER_PATH)
+        except OSError:
+            pass
+
+    def on_source_changed(self, *args):
+        """Source selection / pair-mode change: drop the result and recompute."""
+        names = self.trace_xnames.get(self.trace_combo.currentText(), {})
+        xname = names.get(self.i_combo.currentText())
+        if xname:
+            self.xname_edit.setText(xname)
+        self._sync_phase_mode()
+        self._reset_result()
+        self._plot_key = None        # new/changed source data => re-fit the axes
+        self.redraw()
+        self._live_update()
+
+    def _xname(self):
+        return self.xname_edit.text().strip() or 'X'
+
+    def _remember_xname(self, text):
+        names = self.trace_xnames.setdefault(self.trace_combo.currentText(), {})
+        for combo in (self.i_combo, self.q_combo):
+            if combo.currentText() in self.datasets:
+                names[combo.currentText()] = text
+        self._sync_phase_mode()
+
+    # ---------------------------------------------------------- live update
+    def _run_current_op(self):
+        """Re-run the operation belonging to the currently visible tab.
+
+        The Fit tab (index 0) is intentionally excluded — fitting is an explicit
+        button action, not something to recompute on every keystroke.
+        """
+        ops = {1: self.do_fft, 2: self.do_phase, 3: self.do_smooth, 4: self.do_filter,
+               5: self.do_integrate}
+        fn = ops.get(self.tabs.currentIndex())
+        if fn is not None:
+            fn()
+
+    def _apply_current_op(self):
+        """Run the current tab's operation NOW (Fit included), so the result
+        reflects the current tab and parameters regardless of live-update."""
+        ops = {0: self.do_fit, 1: self.do_fft, 2: self.do_phase, 3: self.do_smooth,
+               4: self.do_filter, 5: self.do_integrate}
+        ops[self.tabs.currentIndex()]()
+
+    def _live_update(self, *args):
+        """Slot wired to every operation parameter; recompute if live mode on."""
+        if self._suppress_live:
+            return
+        if not self.live_check.isChecked() or not self.datasets:
+            return
+        self._run_current_op()
+
+    def _zerofill_n(self, length, choice):
+        """Target FFT length for a zero-fill combo choice ('None', '×2'…, 'Next pow₂')."""
+        return sigproc.zerofill_length(length, choice)
+
+    def _window(self, n, name, param=8.6):
+        """Apodization window of length n (delegates to the shared helper)."""
+        return sigproc.apodization_window(n, name, param)
+
+    def _update_window_param(self, *args):
+        """Relabel + reconfigure the window parameter field for the selected
+        window (Kaiser β / Gaussian σ / Tukey α), or disable it for the
+        zero-parameter windows."""
+        name = self.fft_window.currentText()
+        cfg = self.WINDOW_PARAM.get(name)
+        self.fft_winparam.blockSignals(True)
+        self.fft_winparam_label.setVisible(cfg is not None)
+        self.fft_winparam.setVisible(cfg is not None)
+        if cfg is not None:
+            label, lo, hi, dec, default, step = cfg
+            self.fft_winparam_label.setText(label)
+            self.fft_winparam.setEnabled(True)
+            self.fft_winparam.setDecimals(dec)
+            self.fft_winparam.setRange(lo, hi)
+            self.fft_winparam.setSingleStep(step)
+            self.fft_winparam.setValue(default)
+        else:
+            self.fft_winparam_label.setText('Window param')
+            self.fft_winparam.setEnabled(False)
+        self.fft_winparam.blockSignals(False)
+
+    def _passband_mask(self, freq, ftype, lo, hi):
+        """Boolean keep-mask over `freq`; cutoffs are fractions of f_max (Nyquist)."""
+        af = np.abs(np.asarray(freq, dtype=float))
+        fmax = float(np.max(af)) or 1.0
+        if ftype == 'Low-pass':
+            return af <= hi*fmax
+        if ftype == 'High-pass':
+            return af >= lo*fmax
+        if ftype == 'Band-pass':
+            return (af >= lo*fmax) & (af <= hi*fmax)
+        return np.ones_like(af, dtype=bool)
+
+    # ------------------------------------------------------------- channels
+    def _xy(self, combo):
+        label = combo.currentText()
+        if label in self.datasets:
+            return self.datasets[label]
+        return None, None
+
+    def i_xy(self):
+        return self._xy(self.i_combo)
+
+    def q_xy(self):
+        return self._xy(self.q_combo)
+
+    def is_pair(self):
+        return self.pair_check.isChecked()
+
+    def _distinct_pair(self):
+        """I/Q pair mode with a Q channel that is not the I channel itself (a
+        single-channel file leaves both selectors on the same channel)."""
+        return self.is_pair() and self.q_combo.currentText() != self.i_combo.currentText()
+
+    def _y_unit(self, label):
+        """Unit of a 'Name (unit)' channel label. Promoted step channels lose it,
+        so they take the unit of the trace's loaded channels when that is unique."""
+        unit = _split_unit(label)[1]
+        if unit or not re.match(r'step\d+_', label):
+            return unit
+        units = {_split_unit(k)[1] for k in self.datasets
+                 if not re.match(r'step\d+_', k)} - {''}
+        return units.pop() if len(units) == 1 else ''
+
+    # ------------------------------------------------------------- result
+    def _reset_result(self):
+        self.result_x = None
+        self.result_channels = []
+        self.result_xname = 'X'
+        self.result_show_source = True
+        self.result_meta = []
+        self.result_residuals = None
+        if hasattr(self, 'fit_result'):
+            self.fit_result.setText('')
+        if hasattr(self, 'int_result'):
+            self.int_result.setText('')
+
+    def _set_result(self, x, channels, meta, show_source=True, xname='X',
+                    residuals=None):
+        """Store a result of one or more (label, y) channels and repaint.
+
+        residuals: optional (data - fit) array; when given, the Residuals dock
+        is shown below the preview, otherwise it is hidden."""
+        self.result_x = np.asarray(x, dtype=float)
+        self.result_channels = [(lbl, np.asarray(y, dtype=float)) for lbl, y in channels]
+        self.result_meta = list(meta)
+        self.result_show_source = show_source
+        self.result_xname = xname
+        self.result_residuals = (None if residuals is None
+                                 else np.asarray(residuals, dtype=float))
+        self.redraw()
+
+    def has_result(self):
+        return bool(self.result_channels)
+
+    def promote_result(self):
+        """Register the current result channel(s) as new source curve(s) so the
+        next operation chains off them (e.g. baseline → FFT → phase).
+
+        The current tab's operation is applied first, so the promoted data always
+        matches the visible tab and its parameters — no need to press Apply."""
+        self._apply_current_op()
+        if not self.has_result():
+            self.set_status('No result to chain — run an operation first.')
+            return
+        self.step_counter += 1
+        new_i = new_q = None
+        names = self.trace_xnames.setdefault(self.trace_combo.currentText(), {})
+        for label in self.datasets:
+            names.setdefault(label, self._xname())
+        for idx, (lbl, y) in enumerate(self.result_channels):
+            name = f'step{self.step_counter}_{lbl}'
+            self.datasets[name] = (self.result_x.copy(), np.asarray(y, dtype=float))
+            names[name] = self.result_xname
+            if idx == 0:
+                new_i = name
+            elif idx == 1:
+                new_q = name
+        promoted = ' & '.join(k for k in (new_i, new_q) if k)
+        self._reset_result()
+        # Select the new input and show ONLY it — do not auto re-apply the
+        # operation (that would treat the result a second time).
+        self._suppress_live = True
+        try:
+            self.pair_check.setChecked(new_q is not None)
+            self._refresh_combos(select_i=new_i, select_q=new_q)
+        finally:
+            self._suppress_live = False
+        self.redraw()
+        self.set_status(f'Result registered as {promoted}; shown as the new '
+                        f'input. Choose an operation and apply it.')
+
+    def undo_step(self):
+        """Undo the last 'Result → input': remove the most recent stepN_ channel(s)
+        from the active trace and reselect the previous input (the prior step group,
+        or the original channels). Scoped to the active trace; the global step
+        counter is left alone so future step names stay unique."""
+        steps = {}
+        for k in self.datasets:
+            m = re.match(r'step(\d+)_', k)
+            if m:
+                steps.setdefault(int(m.group(1)), []).append(k)
+        if not steps:
+            self.set_status('No promoted step to undo.')
+            return
+        top = max(steps)
+        removed = steps[top]
+        for k in removed:
+            self.datasets.pop(k, None)
+            self.trace_xnames.get(self.trace_combo.currentText(), {}).pop(k, None)
+        # any pending overlay may have been computed from the removed channels
+        self._reset_result()
+        # reselect the previous step group, else the original (non-step) channels
+        lower = [n for n in steps if n < top]
+        if lower:
+            sel = steps[max(lower)]
+        else:
+            sel = [k for k in self.datasets if not re.match(r'step\d+_', k)]
+        new_i = sel[0] if sel else next(iter(self.datasets), None)
+        new_q = sel[1] if len(sel) > 1 else None
+        self._suppress_live = True
+        try:
+            self.pair_check.setChecked(new_q is not None)
+            self._refresh_combos(select_i=new_i, select_q=new_q)
+        finally:
+            self._suppress_live = False
+        self.redraw()
+        self.set_status(f'Removed {" & ".join(removed)}; '
+                        f'input back to {new_i or "—"}.')
+
+    def clear_result(self):
+        """Drop the computed-result overlay, keep the loaded source data."""
+        self._reset_result()
+        self.redraw()
+        self.set_status('Result cleared.')
+
+    def clear_all(self):
+        """Reset the window: forget all loaded data, result and selectors."""
+        self.datasets = {}
+        self.traces = {}
+        self.trace_colors = {}
+        self.active_colors = {}
+        self.trace_headers = {}
+        self.trace_xnames = {}
+        self._reset_result()
+        self.step_counter = 0
+        for combo in (self.trace_combo, self.i_combo, self.q_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.blockSignals(False)
+        self._sync_header_window()             # after the combos: no stale active
+        for lbl in list(self._curve_items):
+            self.plot_widget.removeItem(self._curve_items.pop(lbl))
+            try:
+                self.legend.removeItem(lbl)
+            except Exception:
+                pass
+        self._set_loaded_file(None)
+        self.set_status('Cleared. Load a dataset to begin.')
+
+    # ----------------------------------------------------- preview (in-process)
+    # Colours drawn from the shared main-window curve palette (CrosshairDock.
+    # CURVE_PALETTE) so this preview matches the LivePlot docks: sources take the
+    # first two palette entries (white I, yellow Q) exactly as the main window
+    # draws the first two curves; results use distinct warm/cool hues so a fit or
+    # derived curve stands out over the source it overlays.
+    SOURCE_PENS = [(255, 255, 255), (255, 255, 0)]     # I = white, Q = yellow
+    RESULT_PENS = [(255, 83, 56), (50, 230, 146), (50, 146, 230)]  # red-orange, green, blue
+    # one colour per trace for the "Fit all traces" overlay (cycled if more) — the
+    # full shared palette, single source of truth so the two never drift.
+    BATCH_COLORS = list(CrosshairDock.CURVE_PALETTE)
+
+    def redraw(self):
+        """Repaint the embedded preview with the source channel(s) and the
+        current result. Curve items are reused (setData) and only stale labels
+        are removed, so live tweaking updates in place without rebuilding."""
+        curves = []  # (label, x, y, pen)
+        xi, yi = self.i_xy()
+        xq, yq = self.q_xy()
+        show_q = (self.is_pair() and xq is not None and len(xq)
+                  and self.q_combo.currentText() != self.i_combo.currentText())
+
+        # keep each source channel in its original plot colour when it was loaded
+        # from the plot; otherwise fall back to the fixed I/Q role pens
+        src_i = self.active_colors.get(self.i_combo.currentText(), self.SOURCE_PENS[0])
+        src_q = self.active_colors.get(self.q_combo.currentText(), self.SOURCE_PENS[1])
+
+        if self.has_result():
+            if self.result_show_source and xi is not None and len(xi):
+                curves.append(('source I', xi, yi, src_i))
+                if show_q:
+                    curves.append(('source Q', xq, yq, src_q))
+            for idx, (lbl, y) in enumerate(self.result_channels):
+                curves.append((lbl, self.result_x, y, self.RESULT_PENS[idx % len(self.RESULT_PENS)]))
+            xname = self.result_xname
+        else:
+            if xi is not None and len(xi):
+                curves.append(('source I', xi, yi, src_i))
+            if show_q:
+                curves.append(('source Q', xq, yq, src_q))
+            xname = self._xname()
+
+        wanted = set()
+        for lbl, x, y, color in curves:
+            wanted.add(lbl)
+            is_src = lbl.startswith('source')
+            pen = pg.mkPen(color, width=1 if is_src else 2)
+            xd, yd = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+            item = self._curve_items.get(lbl)
+            if item is None:
+                self._curve_items[lbl] = self.plot_widget.plot(xd, yd, pen=pen, name=lbl)
+            else:
+                item.setData(xd, yd)
+                item.setPen(pen)
+        # drop curves no longer present (label set changed)
+        for lbl in [k for k in self._curve_items if k not in wanted]:
+            self.plot_widget.removeItem(self._curve_items.pop(lbl))
+            try:
+                self.legend.removeItem(lbl)
+            except Exception:
+                pass
+        # Split a "Name (unit)" label so pyqtgraph gets the unit separately, then
+        # auto-SI-prefix only bare SI bases — a slice transferred in 's' reads in
+        # ns instead of raw 2e-9, while an already-prefixed 'ns'/'MHz' stays as is.
+        xlabel, xunit = _split_unit(xname)
+        self.plot_widget.setLabel('bottom', xlabel, units=xunit)
+        try:
+            _set_autoprefix(self.plot_widget.getPlotItem().getAxis('bottom'),
+                            _si_autoprefix(xunit))
+        except Exception:
+            pass
+        self.plot_widget.setLabel('left', '')
+
+        # Auto-scale the view when the plotted *content* changes (new result,
+        # time unit, load/clear) — but not on same-view live tweaks, so a manual
+        # zoom survives while dragging parameters.
+        key = (frozenset(wanted), xname)
+        if key != self._plot_key:
+            self._plot_key = key
+            self._autoscale(curves)
+
+        self._redraw_residuals(xlabel, xunit)
+
+    def _autoscale(self, curves):
+        """Fit the view to the full data extent.
+
+        autoRange() reads the item's dataBounds, which — with the peak
+        auto-downsampling enabled for render speed — are taken from the
+        *decimated* series. On log-spaced, multi-decade data the sparse
+        high-x samples get dropped from the decimation, so autoRange stops
+        short of the true extent. We therefore compute the range from the raw
+        arrays we already hold (falling back to autoRange for FFT display,
+        where the shown data is transformed)."""
+        vb = self.plot_widget.getPlotItem().getViewBox()
+        try:
+            logx, logy = vb.state['logMode']
+            fft = self.plot_widget.getPlotItem().ctrl.fftCheck.isChecked()
+        except Exception:
+            logx = logy = fft = False
+        xs, ys = [], []
+        if not fft:
+            for _lbl, x, y, _c in curves:
+                x = np.asarray(x, dtype=float)
+                y = np.asarray(y, dtype=float)
+                m = np.isfinite(x) & np.isfinite(y)
+                if m.any():
+                    xs.append(x[m]); ys.append(y[m])
+        if not xs:
+            try:
+                vb.autoRange()
+            except Exception:
+                pass
+            return
+        xall = np.concatenate(xs); yall = np.concatenate(ys)
+
+        def bounds(vals, log):
+            if log:
+                vals = vals[vals > 0]
+                if not vals.size:
+                    return None
+                vals = np.log10(vals)
+            return float(vals.min()), float(vals.max())
+
+        xb = bounds(xall, logx); yb = bounds(yall, logy)
+        try:
+            if xb:
+                vb.setRange(xRange=xb, update=False)
+            if yb:
+                vb.setRange(yRange=yb)
+            if not xb and not yb:
+                vb.autoRange()
+        except Exception:
+            try:
+                vb.autoRange()
+            except Exception:
+                pass
+
+    def _redraw_residuals(self, xlabel, xunit):
+        """Show/update the residuals dock when the current result carries a
+        residuals array (a fit); hide it otherwise. X stays linked to the
+        preview, so panning/zooming the fit pans the residuals with it."""
+        # a single-trace redraw supersedes any 'Fit all traces' residual overlay
+        self._clear_batch_residuals()
+        res = self.result_residuals
+        if res is None or self.result_x is None or not len(res):
+            if self.resid_dock.isVisible():
+                self.resid_dock.hide()
+            return
+        xd = np.asarray(self.result_x, dtype=float)
+        yd = np.asarray(res, dtype=float)
+        pen = pg.mkPen((211, 194, 78), width=1)
+        if self._resid_item is None:
+            self._resid_item = self.resid_widget.plot(xd, yd, pen=pen,
+                                                      name='residual')
+        else:
+            self._resid_item.setData(xd, yd)
+        self.resid_widget.setLabel('bottom', xlabel, units=xunit)
+        self.resid_widget.setLabel('left', 'residual')
+        try:
+            _set_autoprefix(self.resid_widget.getPlotItem().getAxis('bottom'),
+                            _si_autoprefix(xunit))
+        except Exception:
+            pass
+        self._sync_resid_transforms()
+        if not self.resid_dock.isVisible():
+            self.resid_dock.show()
+        try:
+            self.resid_widget.getPlotItem().getViewBox().autoRange()
+        except Exception:
+            pass
+
+    def _sync_resid_transforms(self, *args):
+        """Mirror the preview's X-remapping display transforms (Log X, FFT) onto
+        the residuals plot so the shared X axis stays in one coordinate space.
+        Residual Y is kept linear (residuals cross zero, so Log Y is invalid)."""
+        if not hasattr(self, 'resid_widget'):
+            return
+        main = self.plot_widget.getPlotItem().ctrl
+        resid = self.resid_widget.getPlotItem()
+        logx = main.logXCheck.isChecked()
+        fft = main.fftCheck.isChecked()
+        # setLogMode drives resid's own logX/logY checkboxes + axes + items
+        resid.setLogMode(logx, False)
+        if resid.ctrl.fftCheck.isChecked() != fft:
+            resid.ctrl.fftCheck.setChecked(fft)   # triggers resid's FFT update
+        if self.resid_dock.isVisible():
+            try:
+                resid.getViewBox().autoRange()
+            except Exception:
+                pass
+
+    def set_status(self, text):
+        self.status.setText(text)
+        general.message(text)
+
+    def _set_loaded_file(self, name):
+        """Show the source of the current dataset under the Source buttons."""
+        self.loaded_label.setText(f'File: {name}' if name else 'File: —')
+
+    # ---------------------------------------------------------- operations
+    def _update_fit_formula(self, model):
+        """Refresh the equation shown under the model selector."""
+        formula = self.fitter.model_formula(model)
+        self.fit_formula.setText(
+            f'<span style="color: rgb(160, 160, 190);">{formula}</span>'
+            if formula else '')
+        has_beta = 'beta' in self.fitter.param_names(model)
+        self.fit_fix_beta.setEnabled(has_beta)
+        self.fit_beta.setEnabled(has_beta)
+
+    def _fit_fixed(self, model):
+        """{'beta': value} when Fix β is on and the model has β, else None."""
+        if (self.fit_fix_beta.isChecked()
+                and 'beta' in self.fitter.param_names(model)):
+            return {'beta': self.fit_beta.value()}
+        return None
+
+    def _fit_xy(self, x, y, drop_start, drop_end):
+        """Select the retained samples without shifting X or changing the source."""
+        stop = len(x) - drop_end
+        if stop - drop_start < 2:
+            raise ValueError('Dropping points must leave at least two points to fit.')
+        return (np.asarray(x, dtype=float)[drop_start:stop],
+                np.asarray(y, dtype=float)[drop_start:stop])
+
+    def do_fit(self):
+        x, y = self.i_xy()
+        if x is None or not len(x):
+            self.set_status('No I channel selected.')
+            return
+        model = self.model_combo.currentText()
+        no_offset = self.fit_no_offset.isChecked()
+        fixed = self._fit_fixed(model)
+        drop_start = self.fit_drop_start.value()
+        drop_end = self.fit_drop_end.value()
+        try:
+            x, y = self._fit_xy(x, y, drop_start, drop_end)
+            res = self.fitter.fit(model, x, y, no_offset=no_offset, fixed=fixed)
+        except Exception as e:
+            self.set_status(f'Fit failed: {e}')
+            return
+        st = res.get('stats', {})
+        meta = ['Fit model: ' + model + (' (offset fixed = 0)' if no_offset else '')
+                + (f' (beta fixed = {fixed["beta"]:g})' if fixed else '')]
+        meta.append(f'Dropped points: start={drop_start}, end={drop_end}')
+        meta += [f'{n} = {v:.6g} +/- {e:.3g}'
+                 for n, v, e in zip(res['param_names'], res['popt'], res['perr'])]
+        meta.append(f'R^2 = {res["r_squared"]:.6f}')
+        meta += [f'{k} = {st[k]:.6g}' for k in
+                 ('adj_r_squared', 'rmse', 'red_chi2', 'aicc', 'bic', 'durbin_watson')
+                 if k in st]
+        self._set_result(x, [('fit', res['y_fit'])], meta, show_source=True,
+                         xname=self._xname(), residuals=res['residuals'])
+        trows = [(f'<b>{n}</b>', f'{v:.5g}', f'{e:.3g}')
+                 for n, v, e in zip(res['param_names'], res['popt'], res['perr'])]
+        table = _html_table(['param', 'value', '± err'], trows)
+        off = (' (offset = 0)' if no_offset else '') + (
+            f' (β = {fixed["beta"]:g})' if fixed else '')
+        formula = self.fitter.model_formula(model)
+        formula_row = (f'<span style="color: rgb(160, 160, 190);">{formula}</span><br>'
+                       if formula else '')
+        html = (f'<div style="line-height: 150%;">'
+                f'<b style="color: rgb(211, 194, 78);">{model}</b>{off}<br>'
+                f'{formula_row}{table}{self._fit_stats_html(res)}</div>')
+        self.fit_result.setText(html)
+        self.set_status(f'Fit done. R² = {res["r_squared"]:.5f}')
+
+    _FIT_STATS_TOOLTIP = (
+        '<div style="max-width: 380px;">'
+        '<b>Goodness of fit</b><br>'
+        'Diagnostics beyond R², to judge whether a model is right and to '
+        'compare models on the same data.'
+        '<ul style="margin: 4px 0 0 -22px;">'
+        '<li><b>R²</b> — fraction of variance explained (1 = perfect). Always '
+        'rises when parameters are added, so it cannot, on its own, tell you a '
+        'model is over-fitted or the wrong shape.</li>'
+        '<li><b>adj. R²</b> — R² penalized for the number of parameters. A '
+        'bigger model only improves it if the extra terms genuinely help.</li>'
+        '<li><b>RMSE</b> — root-mean-square residual, in the signal\'s own '
+        'units. The typical distance between data and fit.</li>'
+        '<li><b>red. χ²</b> — reduced chi-square. With no measured error bars '
+        'the noise is estimated from the residuals, so this is ≈1 by '
+        'construction; shown for completeness.</li>'
+        '<li><b>AICc / BIC</b> — information criteria for model selection. '
+        'Absolute values are meaningless; the <i>difference</i> between two '
+        'fits of the same trace is what counts — <b>lower is better</b>. A '
+        'drop &gt; ~10 is decisive evidence for the lower model. BIC penalizes '
+        'extra parameters more strongly than AICc.</li>'
+        '<li><b>Durbin–Watson</b> — tests whether residuals are serially '
+        'correlated. <b>≈ 2</b> means random, unstructured residuals (good); '
+        'much less than 2 (positive correlation) or much more than 2 means the '
+        'residuals drift systematically — the model is the wrong shape even if '
+        'R² looks excellent. Shown green for 1.5–2.5, amber otherwise.</li>'
+        '</ul></div>')
+
+    @staticmethod
+    def _fit_stats_html(res):
+        """Goodness-of-fit / model-selection block for the fit panel."""
+        st = res.get('stats', {})
+        r2 = res.get('r_squared', float('nan'))
+
+        def cell(v, fmt='.5g'):
+            try:
+                return '-' if v != v else format(v, fmt)   # v!=v => NaN
+            except (TypeError, ValueError):
+                return '-'
+
+        # Durbin-Watson colouring: ~2 is ideal (white residuals); flag drift.
+        dw = st.get('durbin_watson', float('nan'))
+        dw_ok = dw == dw and 1.5 <= dw <= 2.5
+        dw_txt = cell(dw, '.3f')
+        if dw == dw:
+            colour = 'rgb(120, 200, 120)' if dw_ok else 'rgb(214, 160, 78)'
+            hint = 'random' if dw_ok else 'structured'
+            dw_txt = f'<span style="color:{colour};">{dw_txt} ({hint})</span>'
+
+        rows = [
+            ('R²', cell(r2, '.5f')),
+            ('adj. R²', cell(st.get('adj_r_squared'), '.5f')),
+            ('RMSE', cell(st.get('rmse'))),
+            ('red. χ²', cell(st.get('red_chi2'))),
+            ('AICc', cell(st.get('aicc'), '.1f')),
+            ('BIC', cell(st.get('bic'), '.1f')),
+            ('Durbin–Watson', dw_txt),
+        ]
+        table = _html_table(['statistic', 'value'], rows)
+        note = ('<span style="color: rgb(150, 150, 175); font-size: 11px;">'
+                'lower AICc/BIC ⇒ better model (compare across fits); '
+                'Durbin–Watson ≈ 2 ⇒ unstructured residuals</span>')
+        return (f'<br><br><b style="color: rgb(160, 160, 190);">Goodness of fit</b>'
+                f'<br>{table}<br>{note}')
+
+    def fit_all_traces(self):
+        """Fit the current model to the I channel of every loaded trace, overlay
+        the data + fits, and collect a per-trace parameter table (saveable as CSV).
+        Useful for batch lsq fits, e.g. T₂ across a series of traces."""
+        n = self.trace_combo.count()
+        if n == 0:
+            self.set_status('No traces loaded.')
+            return
+        model = self.model_combo.currentText()
+        no_offset = self.fit_no_offset.isChecked()
+        fixed = self._fit_fixed(model)
+        drop_start = self.fit_drop_start.value()
+        drop_end = self.fit_drop_end.value()
+        names = [self.trace_combo.itemText(i) for i in range(n)]
+        rows, overlays, failed = [], [], []
+        self.fit_all_btn.setEnabled(False)
+        self.fit_all_btn.setStyleSheet(BUTTON_BUSY_STYLE)
+        try:
+            for i, name in enumerate(names):
+                self.trace_combo.setCurrentIndex(i)        # activate -> i_xy()
+                x, y = self.i_xy()
+                if x is None or not len(x):
+                    failed.append(name)
+                    continue
+                try:
+                    fit_x, fit_y = self._fit_xy(x, y, drop_start, drop_end)
+                    res = self.fitter.fit(model, fit_x, fit_y, no_offset=no_offset,
+                                          fixed=fixed)
+                except Exception as e:
+                    failed.append(f'{name} ({e})')
+                    continue
+                rows.append((name, res))
+                overlays.append((name, np.asarray(x, float), np.asarray(y, float),
+                                 fit_x, fit_y, np.asarray(res['y_fit'], float)))
+                self.set_status(f'Fit all: {i + 1}/{n} — {name}…')
+                QApplication.processEvents()
+        finally:
+            self.fit_all_btn.setEnabled(True)
+            self.fit_all_btn.setStyleSheet(BUTTON_STYLE)
+        if not rows:
+            self.set_status('Fit all: no trace could be fit. Failed: ' + '; '.join(failed))
+            return
+        self._reset_result()                  # drop any single-trace result overlay
+        self._render_fit_batch(overlays)
+        # parameter table (kept per-row so models with different param sets are ok)
+        self.fit_table = {'model': model, 'rows': [],
+                          'drop_start': drop_start, 'drop_end': drop_end}
+        pnames = []                            # union of param names, first-seen order
+        for _, res in rows:
+            for p in res['param_names']:
+                if p not in pnames:
+                    pnames.append(p)
+
+        def _dw_cell(dw):
+            """Durbin–Watson cell, coloured green (random) / amber (structured)."""
+            if dw != dw:                       # NaN
+                return '—'
+            ok = 1.5 <= dw <= 2.5
+            colour = 'rgb(120, 200, 120)' if ok else 'rgb(214, 160, 78)'
+            return f'<span style="color:{colour};">{dw:.2f}</span>'
+
+        trows = []
+        for name, res in rows:
+            st = res.get('stats', {})
+            # per-row: params + errs + the full goodness-of-fit dict (CSV keeps all)
+            self.fit_table['rows'].append(
+                (name, list(res['param_names']), list(map(float, res['popt'])),
+                 list(map(float, res['perr'])), float(res['r_squared']), dict(st)))
+            d = dict(zip(res['param_names'], res['popt']))
+            adj = st.get('adj_r_squared', float('nan'))
+            rmse = st.get('rmse', float('nan'))
+            aicc = st.get('aicc', float('nan'))
+            dw = st.get('durbin_watson', float('nan'))
+            cells = ([f'<b>{name}</b>']
+                     + [f'{d[p]:.4g}' if p in d else '—' for p in pnames]
+                     + [f'{res["r_squared"]:.4f}',
+                        ('—' if adj != adj else f'{adj:.4f}'),
+                        ('—' if rmse != rmse else f'{rmse:.4g}'),
+                        ('—' if aicc != aicc else f'{aicc:.1f}'),
+                        _dw_cell(dw)])
+            trows.append(cells)
+        table = _html_table(
+            ['trace'] + pnames + ['R²', 'adj.R²', 'RMSE', 'AICc', 'DW'], trows)
+        formula = self.fitter.model_formula(model)
+        formula_row = (f'<span style="color: rgb(160, 160, 190);">{formula}</span><br>'
+                       if formula else '')
+        note = ('<span style="color: rgb(150, 150, 175); font-size: 11px;">'
+                'DW ≈ 2 ⇒ unstructured residuals (green); off-2 (amber) ⇒ wrong '
+                'model shape. Lower AICc ⇒ better model (compare across fits); '
+                '</span>')
+        self.fit_result.setText('<div style="line-height: 150%;">'
+                                f'<b style="color: rgb(211, 194, 78);">{model}</b>'
+                                + (f' (β = {fixed["beta"]:g})' if fixed else '') + ' — '
+                                f'{len(rows)} trace(s)<br>{formula_row}{table}'
+                                f'<br>{note}</div>')
+        self.fit_save_table_btn.setEnabled(True)
+        msg = f'Fit all: {len(rows)}/{n} trace(s) with {model}.'
+        if failed:
+            msg += ' Failed: ' + '; '.join(failed)
+        self.set_status(msg)
+
+    def _render_fit_batch(self, overlays):
+        """Overlay each trace's data (thin) + fit (dashed) on the preview, one
+        colour per trace, and overlay the matching residuals in the Residuals
+        dock. A later single-trace redraw drops both automatically."""
+        for lbl in list(self._curve_items):
+            self.plot_widget.removeItem(self._curve_items.pop(lbl))
+            try:
+                self.legend.removeItem(lbl)
+            except Exception:
+                pass
+        resid_overlays = []
+        for i, (name, x, y, fit_x, fit_y, yfit) in enumerate(overlays):
+            # the fit used the trace's I (first) channel — reuse its preserved
+            # plot colour so the overlay matches the source plot; else cycle
+            chans = self.traces.get(name, {})
+            i_key = next(iter(chans), None)
+            col = (self.trace_colors.get(name, {}).get(i_key)
+                   or self.BATCH_COLORS[i % len(self.BATCH_COLORS)])
+            self._curve_items[name] = self.plot_widget.plot(
+                x, y, pen=pg.mkPen(col, width=1), name=name)
+            self._curve_items[f'{name} fit'] = self.plot_widget.plot(
+                fit_x, yfit, pen=pg.mkPen(col, width=2, style=Qt.PenStyle.DashLine),
+                name=f'{name} fit')
+            resid_overlays.append((name, fit_x, fit_y - yfit, col))
+        # keep the preview x-axis label + SI prefix in step with the residuals
+        # (the batch bypasses redraw(), which is what normally sets these)
+        xlabel, xunit = _split_unit(self._xname())
+        self.plot_widget.setLabel('bottom', xlabel, units=xunit)
+        try:
+            _set_autoprefix(self.plot_widget.getPlotItem().getAxis('bottom'),
+                            _si_autoprefix(xunit))
+        except Exception:
+            pass
+        self._plot_key = None                 # force the next single redraw to refit
+        self._render_batch_residuals(resid_overlays)
+        try:
+            self.plot_widget.autoRange()
+        except Exception:
+            pass
+
+    def _clear_batch_residuals(self):
+        """Remove any 'Fit all traces' residual overlay curves from the dock."""
+        for it in self._batch_resid_items.values():
+            try:
+                self.resid_widget.removeItem(it)
+            except Exception:
+                pass
+        self._batch_resid_items = {}
+
+    def _render_batch_residuals(self, resid_overlays):
+        """Overlay each trace's residual (data − fit) in the Residuals dock, one
+        colour per trace matching the batch overlay. The shared X-link and
+        _sync_resid_transforms keep Log X / FFT display consistent with the
+        preview, exactly as for a single-trace residual."""
+        self._clear_batch_residuals()
+        if self._resid_item is not None:      # drop any single-trace residual
+            try:
+                self.resid_widget.removeItem(self._resid_item)
+            except Exception:
+                pass
+            self._resid_item = None
+        if not resid_overlays:
+            self.resid_dock.hide()
+            return
+        for name, x, resid, col in resid_overlays:
+            self._batch_resid_items[name] = self.resid_widget.plot(
+                np.asarray(x, float), np.asarray(resid, float),
+                pen=pg.mkPen(col, width=1), name=name)
+        # x-axis label + SI auto-prefix, same as the single-trace residual (else
+        # a time axis shows raw seconds, e.g. 2e-7, instead of ns/µs/ms)
+        xlabel, xunit = _split_unit(self._xname())
+        self.resid_widget.setLabel('bottom', xlabel, units=xunit)
+        self.resid_widget.setLabel('left', 'residual')
+        try:
+            _set_autoprefix(self.resid_widget.getPlotItem().getAxis('bottom'),
+                            _si_autoprefix(xunit))
+        except Exception:
+            pass
+        self._wire_resid_legend_hide()
+        self._sync_resid_transforms()
+        if not self.resid_dock.isVisible():
+            self.resid_dock.show()
+        try:
+            self.resid_widget.getPlotItem().getViewBox().autoRange()
+        except Exception:
+            pass
+
+    def _wire_resid_legend_hide(self):
+        """Make each Residuals-dock legend entry a click-to-hide toggle for its
+        curve, so a dominant trace can be removed from the shared y-scale. Left
+        click on the label or its colour sample flips that residual's visibility
+        and dims the legend entry; the view re-autoscales to what's left."""
+        leg = getattr(self, 'resid_legend', None)
+        if leg is None:
+            return
+        for sample, label in list(leg.items):
+            item = self._batch_resid_items.get(label.text)
+            if item is None:
+                continue
+            handler = (lambda ev, it=item, lb=label:
+                       self._toggle_resid_curve(ev, it, lb))
+            label.mouseClickEvent = handler
+            sample.mouseClickEvent = handler
+
+    def _toggle_resid_curve(self, ev, item, label):
+        if ev.button() != Qt.MouseButton.LeftButton:
+            ev.ignore()
+            return
+        ev.accept()
+        visible = not item.isVisible()
+        item.setVisible(visible)
+        label.setOpacity(1.0 if visible else 0.35)   # dim when hidden
+        try:                                          # rescale to visible curves
+            self.resid_widget.getPlotItem().getViewBox().autoRange()
+        except Exception:
+            pass
+
+    def save_fit_table(self):
+        """Save the 'Fit all traces' parameter table as CSV (one row per trace)."""
+        tbl = getattr(self, 'fit_table', None)
+        if not tbl or not tbl['rows']:
+            self.set_status('No fit table — run "Fit all traces" first.')
+            return
+        path = self._save_dialog()
+        if not path or path == 'None':
+            return
+        # union of parameter names across rows, in first-seen order
+        pnames = []
+        for row in tbl['rows']:
+            for p in row[1]:
+                if p not in pnames:
+                    pnames.append(p)
+        # goodness-of-fit columns appended after the parameters (full set, unlike
+        # the on-screen table which shows only R²/adj.R²/RMSE/DW to stay readable)
+        stat_keys = ['adj_r_squared', 'rmse', 'red_chi2', 'aic', 'aicc', 'bic',
+                     'durbin_watson']
+        header = (['trace'] + [c for p in pnames for c in (p, f'{p}_err')]
+                  + ['R2'] + stat_keys)
+        lines = [','.join(header)]
+        for name, pn, vals, errs, r2, st in tbl['rows']:
+            d = {p: (v, e) for p, v, e in zip(pn, vals, errs)}
+            cells = [str(name).replace(',', ';')]
+            for p in pnames:
+                v, e = d.get(p, (float('nan'), float('nan')))
+                cells += [f'{v:.6g}', f'{e:.6g}']
+            cells.append(f'{r2:.6f}')
+            cells += [f'{st.get(k, float("nan")):.6g}' for k in stat_keys]
+            lines.append(','.join(cells))
+        try:
+            with open(path, 'w') as fh:
+                fh.write(f'# Fit-all parameter table, model: {tbl["model"]}\n')
+                fh.write(f'# Dropped points: start={tbl["drop_start"]}, '
+                         f'end={tbl["drop_end"]}\n')
+                fh.write('\n'.join(lines) + '\n')
+        except OSError as e:
+            self.set_status(f'Could not save table: {e}')
+            return
+        self.set_status(f'Saved fit table ({len(tbl["rows"])} rows) to '
+                        f'{os.path.basename(path)}.')
+
+    def _spectrum_channels(self, sp, mode):
+        """Map a complex spectrum to a list of (label, y) per the output mode."""
+        if mode == 'Magnitude':
+            return [('|FFT|', np.abs(sp))]
+        if mode == 'Real':
+            return [('Re', np.real(sp))]
+        if mode == 'Imaginary':
+            return [('Im', np.imag(sp))]
+        return [('Re', np.real(sp)), ('Im', np.imag(sp))]   # Real + Imaginary
+
+    def auto_echo_center(self):
+        """Fill 'skip pts' with the echo centre = peak of the magnitude envelope
+        (|I+iQ| for an I/Q pair, else |I|), so the field-offset modulation
+        cancels before the peak search."""
+        x, i = self.i_xy()
+        if x is None or len(i) < 3:
+            self.set_status('Load data first (need at least three points).')
+            return
+        i = np.asarray(i, dtype=float)
+        if self.is_pair():
+            xq, q = self.q_xy()
+            q = np.asarray(q, dtype=float)
+            env = np.sqrt(i**2 + q**2) if q.shape == i.shape else np.abs(i)
+        else:
+            env = np.abs(i)
+        k = sigproc.echo_center(env)
+        self.fft_skip.setValue(int(k))
+        self.set_status(f'Echo centre at point {k} (skip set).')
+
+    @staticmethod
+    def _fft_freq_scale(dt, xname):
+        """Sample step + frequency unit for an FFT, from the X-axis unit parsed
+        out of `xname` (mirrors the 2D tool's _freq_axis): ps/ns/µs/ms → MHz, s → Hz,
+        unknown/none → raw 1/(X units). Returns (step_for_fftfreq, freq_unit)."""
+        unit = _split_unit(xname)[1].strip().lower()
+        if unit == 's':
+            return dt, 'Hz'
+        try:
+            return float(fft_module.time_axis_ns([dt], unit)[0])*1e-3, 'MHz'
+        except ValueError:
+            return dt, ''
+
+    def do_fft(self):
+        x, i = self.i_xy()
+        if x is None or len(x) < 2:
+            self.set_status('Need at least two points for an FFT.')
+            return
+        x = np.asarray(x, dtype=float)
+        i = np.asarray(i, dtype=float)
+        dt = float(np.mean(np.diff(x)))
+        if dt == 0:
+            self.set_status('X axis has zero spacing; cannot compute FFT.')
+            return
+
+        pair = self.is_pair()
+        if pair:
+            xq, q = self.q_xy()
+            q = np.asarray(q, dtype=float)
+            if q.shape != i.shape:
+                self.set_status('I and Q channels must have the same length for a complex FFT.')
+                return
+            signal = i + 1j*q
+        else:
+            signal = i
+
+        # drop leading points so the transform starts at the echo centre; this
+        # sets t = 0 there and removes the dead-time first-order phase ramp.
+        skip = max(0, min(int(self.fft_skip.value()), len(signal) - 2))
+        signal = signal[skip:]
+
+        # apodization window applied to the time-domain signal before transform
+        win = self.fft_window.currentText()
+        wparam = self.fft_winparam.value()
+        signal = signal*self._window(len(signal), win, wparam)
+
+        zf = self.fft_zerofill.currentText()
+        n = self._zerofill_n(len(signal), zf)
+        sp = np.fft.fft(signal, n)
+        # Frequency axis in physical units derived from the X (time) unit, so the
+        # spectrum is the same whether the trace arrived in 's' (from a plot, where
+        # dt≈2e-9) or in 'ns' (from a file, where dt≈2): s→Hz, ns/µs/ms→MHz. Using
+        # the raw 1/dt instead leaves the two sources off by 1e9 (see the 2D tool's
+        # _freq_axis, the same convention).
+        d, funit = self._fft_freq_scale(dt, self._xname())
+        freq = np.fft.fftfreq(n, d)
+        order = np.argsort(freq)
+        freq = freq[order]
+        sp = sp[order]
+
+        # optional passband mask on the spectrum
+        ftype = self.fft_filter.currentText()
+        if ftype != 'None':
+            sp = sp*self._passband_mask(freq, ftype, self.fft_cut_lo.value(),
+                                        self.fft_cut_hi.value())
+
+        mode = self.fft_mode.currentText()
+        channels = self._spectrum_channels(sp, mode)
+        fxname = f'Frequency ({funit})' if funit else 'Frequency'
+        meta = [f'FFT ({"complex I+iQ" if pair else "real"}), output: {mode}',
+                f'frequency in {funit}' if funit else 'frequency in 1/(X units)',
+                f'skip {skip} leading pts (echo centre)' if skip else 'no leading skip',
+                f'window: {win}' + (f' (param={wparam:.4g})'
+                                    if win in self.WINDOW_PARAM else ''),
+                f'points: {len(signal)} -> {n} (zero fill: {zf})',
+                f'passband: {ftype}' + ('' if ftype == 'None' else
+                    f' (lo={self.fft_cut_lo.value():.4g}, hi={self.fft_cut_hi.value():.4g} x f_max)')]
+        self._set_result(freq, channels, meta, show_source=False, xname=fxname)
+        self.set_status(f'FFT ({mode}); window {win}; passband {ftype}; '
+                        f'{len(signal)}→{n} pts.')
+
+    def _phase_input(self):
+        """Validate the selected I/Q pair and return its complex signal."""
+        il, ql = self.i_combo.currentText(), self.q_combo.currentText()
+        if il not in self.datasets or ql not in self.datasets:
+            raise ValueError('Select both I and Q channels above.')
+        x, i = self.datasets[il]
+        xq, q = self.datasets[ql]
+        x, xq = np.asarray(x, dtype=float), np.asarray(xq, dtype=float)
+        i, q = np.asarray(i, dtype=float), np.asarray(q, dtype=float)
+        if i.shape != q.shape or i.size < 2 or x.shape != i.shape:
+            raise ValueError('I and Q channels must have the same length (≥ 2).')
+        if xq.shape != x.shape or not np.allclose(x, xq, rtol=1e-9, atol=0):
+            raise ValueError('I and Q channels must have the same X axis.')
+        if not (np.isfinite(x).all() and np.isfinite(i).all() and np.isfinite(q).all()):
+            raise ValueError('Phase correction requires finite I/Q data and axis values.')
+        return x, i + 1j*q
+
+    def _phase_spectrum(self, x, sig):
+        """Return the existing spectrum with its phase coordinates in MHz."""
+        try:
+            freq = fft_module.frequency_axis_mhz(x, _split_unit(self._xname())[1])
+        except ValueError as exc:
+            raise ValueError('Frequency-domain mode needs a frequency axis (Hz, kHz, MHz, GHz or THz). '
+                             'For time data, use FFT → Result → input first.') from exc
+        return x, freq, sig, self._xname()
+
+    def _spectral_phase(self, freq, include_zero=True):
+        offset = freq - self.phase_pivot.value()
+        phi = self.phase_freq_first.value()*offset + self.phase_freq_second.value()*offset**2
+        if include_zero:
+            phi = phi + self.phase_freq_zero.value()
+        return np.deg2rad(phi)
+
+    def auto_phase_zero(self):
+        """Estimate constant phase in the selected domain after higher orders."""
+        try:
+            x, sig = self._phase_input()
+            if self.phase_mode.currentIndex() == 1:
+                _, freq, sig, _ = self._phase_spectrum(x, sig)
+                sig = sig*np.exp(1j*self._spectral_phase(freq, include_zero=False))
+                phi = self.fft.auto_phase_zero(sig)
+                self.phase_freq_zero.setValue(phi)
+                self.set_status(f'Auto φ₀ = {phi:.2f}° (frequency domain, first/second order applied).')
+                return
+            t = fft_module.time_axis_ns(x, _split_unit(self._xname())[1])
+        except ValueError as exc:
+            self.set_status(str(exc))
+            return
+        dt = float(np.mean(np.diff(t)))
+        v1 = float(self.phase_first.value())
+        sig = sig*np.exp(2j*np.pi*v1*t/1000.0)
+        phi = self.fft.auto_phase_zero_echo(sig)
+        self.phase_zero.setValue(phi)
+        f0 = self._carrier(sig, dt)*1000.0 if dt else 0.0
+        env = np.abs(sig)
+        width = abs(dt)*max(1, int(np.count_nonzero(env >= 0.25*env.max())))
+        if abs(f0)*width/1000.0 > 0.125:
+            self.set_status(f'Auto φ₀ = {phi:.2f}° (echo), but the signal '
+                            f'still sits at {f0:+.2f} MHz: set Frequency shift '
+                            f'= {v1 - f0:.3f} MHz and press Auto again.')
+        else:
+            self.set_status(f'Auto φ₀ = {phi:.2f}° (echo, frequency shift applied).')
+
+    @staticmethod
+    def _carrier(sig, dt):
+        """Carrier offset of the echo, measured on a band-limited copy.
+
+        `carrier_offset` reads the phase increment between neighbouring samples,
+        which the out-of-band noise of an undemodulated record swamps: a raw
+        SIFTER record reads +0.02 MHz where the true offset is −0.40. An echo of
+        width W cannot be spectrally wider than a few times 1/W, so everything
+        beyond 10/W of the echo's spectral peak is noise and is dropped before
+        measuring; centring on the peak keeps a large raw IF offset in band."""
+        z = np.atleast_2d(np.asarray(sig, dtype=complex))
+        env = np.abs(z).mean(axis=0)
+        echo = env >= 0.25*env.max()
+        width = abs(dt)*max(1, int(np.count_nonzero(echo)))
+        f = np.fft.fftfreq(z.shape[1], dt)
+        fc = f[int(np.abs(np.fft.fft(z*echo, axis=1)).sum(axis=0).argmax())]
+        S = np.fft.fft(z, axis=1)
+        S[:, np.abs(f - fc) > 10.0/width] = 0
+        return fft_module.Fast_Fourier.carrier_offset(np.fft.ifft(S, axis=1), dt)
+
+    @staticmethod
+    def _imag_fraction(W):
+        """Imaginary energy left in `W` after its best zero-order rotation."""
+        W = W*np.exp(-1j*np.angle((W**2).sum())/2)
+        denom = np.abs(W).sum()
+        return float(np.abs(W.imag).sum()/denom) if denom else 1.0
+
+    def _refine_first(self, sig, x, v1):
+        """Grid-search the first order about `v1` for the least imaginary residue
+        over the echo region, parabolically refined.
+
+        The carrier estimate is the intensity centroid of the line, which is not
+        where the trace phases best when the line is asymmetric — on the SIFTER
+        records the centroid lands at about half the residue-optimal value. The
+        residue is what phasing is actually for, so it decides the final number."""
+        env = np.abs(sig)
+        echo = env >= 0.25*env.max()
+        se = sig[echo]
+        te = x[echo] - x[int(env.argmax())]
+        grid = v1 + np.arange(-1.0, 1.0001, 0.02)
+        res = np.array([self._imag_fraction(se*np.exp(2j*np.pi*g/1000.0*te))
+                        for g in grid])
+        j = int(res.argmin())
+        best = float(grid[j])
+        if 0 < j < grid.size - 1:
+            p = np.polyfit(grid[j-1:j+2], res[j-1:j+2], 2)
+            if p[0] > 0:
+                best = float(-p[1]/(2*p[0]))
+        return best, float(res[j])
+
+    def auto_phase_first(self):
+        """Cancel the time-domain carrier, refine the shift, then set zero order."""
+        if self.phase_mode.currentIndex() != 0:
+            self.set_status('Frequency-shift Auto is available in time-domain mode; spectral phase orders are manual.')
+            return
+        try:
+            x, sig0 = self._phase_input()
+            t = fft_module.time_axis_ns(x, _split_unit(self._xname())[1])
+            dt = float(np.mean(np.diff(t)))
+            if dt == 0 or not np.allclose(np.diff(t), dt, rtol=1e-5, atol=1e-9):
+                raise ValueError('Carrier Auto needs a uniformly spaced time axis with nonzero spacing.')
+        except ValueError as exc:
+            self.set_status(str(exc))
+            return
+        v1 = v1_in = float(self.phase_first.value())
+        for _ in range(8):
+            sig = sig0*np.exp(2j*np.pi*v1*t/1000.0)
+            f0 = self._carrier(sig, dt)*1000.0
+            v1 -= f0
+            if abs(f0) < 1e-3:
+                break
+        v1, res = self._refine_first(sig0, t, v1)
+        self._suppress_live = True
+        try:
+            self.phase_first.setValue(v1)
+        finally:
+            self._suppress_live = False
+        self.auto_phase_zero()
+        phi0_msg = self.status.text()
+        self.set_status(f'Auto frequency shift = {v1:.3f} MHz ({v1 - v1_in:+.3f} on the entered '
+                        f'value), {100*res:.1f} % imaginary left over the echo; '
+                        f'then {phi0_msg[0].lower()}{phi0_msg[1:]}')
+
+    def do_phase(self):
+        try:
+            x, sig = self._phase_input()
+            spectral = self.phase_mode.currentIndex() == 1
+            if spectral:
+                axis, freq, sig, xname = self._phase_spectrum(x, sig)
+                corrected = sig*np.exp(1j*self._spectral_phase(freq))
+                detail = (f'zero order = {self.phase_freq_zero.value():.4g} deg, '
+                          f'first = {self.phase_freq_first.value():.4g} deg/MHz, '
+                          f'second = {self.phase_freq_second.value():.4g} deg/MHz², '
+                          f'pivot = {self.phase_pivot.value():.4g} MHz')
+                domain = 'frequency'
+            else:
+                t = fft_module.time_axis_ns(x, _split_unit(self._xname())[1])
+                phase = np.deg2rad(self.phase_zero.value()) + 2*np.pi*self.phase_first.value()*t/1000.0
+                corrected = sig*np.exp(1j*phase)
+                axis, xname, domain = x, self._xname(), 'time'
+                detail = (f'zero order = {self.phase_zero.value():.4g} deg, '
+                          f'frequency shift = {self.phase_first.value():.4g} MHz')
+        except ValueError as exc:
+            self._reset_result()
+            self.redraw()
+            self.set_status(str(exc))
+            return
+        mode = self.phase_out.currentText()
+        real, imag = corrected.real, corrected.imag
+        if mode == 'Real':
+            channels = [('Re', real)]
+        elif mode == 'Imaginary':
+            channels = [('Im', imag)]
+        elif mode == 'Magnitude':
+            channels = [('|phase|', np.abs(corrected))]
+        else:
+            channels = [('Re', real), ('Im', imag)]
+        meta = [f'Phase correction, output: {mode}; domain: {domain}',
+                f'I = {self.i_combo.currentText()}, Q = {self.q_combo.currentText()}', detail]
+        self._set_result(axis, channels, meta,
+                         show_source=True, xname=xname)
+        self.set_status(f'Phase correction applied ({domain}, {mode}).')
+
+    def _apply_smooth(self, x, y, method):
+        if method == 'Savitzky-Golay':
+            return self.sp.savitzky_golay(y, self.smooth_window.value(),
+                                          self.smooth_order.value())
+        elif method == 'Moving average':
+            return self.sp.moving_average(y, self.smooth_window.value())
+        elif method == 'Baseline subtract':
+            region = {'All points': 'all', 'First N points': 'first',
+                      'Last N points': 'last', 'First & last N': 'ends'}.get(
+                          self.base_region.currentText(), 'all')
+            return self.sp.baseline_poly(x, y, self.smooth_order.value(),
+                                         region=region, npts=self.base_npts.value())
+        else:  # Normalize
+            return self.sp.normalize(y, 'minmax')
+
+    def do_smooth(self):
+        x, i = self.i_xy()
+        if x is None or not len(x):
+            self.set_status('No I channel selected.')
+            return
+        x = np.asarray(x, dtype=float)
+        i = np.asarray(i, dtype=float)
+        method = self.smooth_method.currentText()
+        try:
+            if self._distinct_pair():
+                xq, q = self.q_xy()
+                q = np.asarray(q, dtype=float)
+                if q.shape != i.shape:
+                    self.set_status('I and Q channels must have the same length.')
+                    return
+                out_i = self._apply_smooth(x, i, method)
+                out_q = self._apply_smooth(x, q, method)
+                channels = [('I', out_i), ('Q', out_q)]
+            else:
+                channels = [('smoothed', self._apply_smooth(x, i, method))]
+        except Exception as e:
+            self.set_status(f'{method} failed: {e}')
+            return
+        meta = [f'Smoothing: {method}'
+                + (' (I & Q)' if self._distinct_pair() else ''),
+                f'window = {self.smooth_window.value()}, '
+                f'poly order = {self.smooth_order.value()}']
+        if method == 'Baseline subtract':
+            meta.append(f'baseline from: {self.base_region.currentText()} '
+                        f'(N = {self.base_npts.value()})')
+        self._set_result(x, channels, meta, show_source=True, xname=self._xname())
+        self.set_status(f'{method} applied'
+                        + (' to I & Q.' if self._distinct_pair() else '.'))
+
+    def do_integrate(self):
+        """First integral (absorption) or double integral of the I channel, or of
+        I and Q, over the X window. The absorption can have a straight baseline
+        through its end points removed before the second integration."""
+        x, i = self.i_xy()
+        if x is None or len(x) < 2:
+            self.set_status('Need at least two points to integrate.')
+            return
+        x = np.asarray(x, dtype=float)
+        combos = [self.i_combo]
+        chans = [np.asarray(i, dtype=float)]
+        pair = self._distinct_pair()
+        if pair:
+            xq, q = self.q_xy()
+            q = np.asarray(q, dtype=float)
+            if q.shape != chans[0].shape:
+                self.set_status('I and Q channels must have the same length.')
+                return
+            combos.append(self.q_combo)
+            chans.append(q)
+        # integrate along increasing X, whatever the stored order
+        order = np.argsort(x, kind='stable')
+        x = x[order]
+        chans = [y[order] for y in chans]
+        lo, hi = sorted((self.int_from.value(), self.int_to.value()))
+        if lo != hi:
+            sel = (x >= lo) & (x <= hi)
+            if sel.sum() < 2:
+                self.set_status('Fewer than two points inside the X window.')
+                return
+            x = x[sel]
+            chans = [y[sel] for y in chans]
+        npts = self.int_npts.value()
+        base = self.int_base_check.isChecked()
+        if base and 2*npts >= len(x):
+            self.set_status(f'N points ({npts}) must be less than half of the '
+                            f'{len(x)} points integrated.')
+            return
+
+        output = self.int_output.currentText()
+        xunit = _split_unit(self._xname())[1]
+        channels, rows, values = [], [], []
+        for combo, y in zip(combos, chans):
+            absorption = _cumtrapz(x, y)
+            raw_end = absorption[-1]
+            if base:
+                absorption = self.sp.baseline_poly(x, absorption, 1, region='ends', npts=npts)
+            double = _cumtrapz(x, absorption)
+            if output == 'First integral':
+                out, name = absorption, 'absorption'
+            else:
+                out, name = double, 'double integral'
+            label = combo.currentText()
+            yunit = self._y_unit(label)
+            u1, u2 = _unit_product(yunit, xunit, 1), _unit_product(yunit, xunit, 2)
+            channels.append(((('I ', 'Q ')[len(channels)] + name) if pair else name, out))
+            rows.append([label, f'{raw_end:.6g} {u1}'.strip(), f'{double[-1]:.6g} {u2}'.strip()])
+            values.append(f'{label}: integral at end (before absorption baseline) = '
+                          f'{raw_end:.6g} {u1}; double integral = {double[-1]:.6g} {u2}')
+
+        window = 'whole trace' if lo == hi else f'{lo:.6g} to {hi:.6g} {xunit}'.strip()
+        meta = [f'Integration: {output} (cumulative trapezoid)' + (' (I & Q)' if pair else ''),
+                f'X window: {window} ({len(x)} points)',
+                f'absorption baseline: straight line from first & last {npts} points'
+                if base else 'absorption baseline: none'] + values
+        self._set_result(x, channels, meta, show_source=False, xname=self._xname())
+        self.int_result.setText(_html_table(['channel', '∫ y dx at end', '∫∫ y dx²'], rows))
+        self.set_status(f'{output} computed over '
+                        + ('the whole trace' if lo == hi else window)
+                        + (' for I & Q; ' if pair else '; ')
+                        + f'double integral = {rows[0][2]}'
+                        + (f' (I), {rows[1][2]} (Q).' if pair else '.'))
+
+    def do_filter(self):
+        """FFT → zero frequencies outside the passband → inverse FFT, giving a
+        cleaned time-domain signal (I/Q pair filtered together)."""
+        x, i = self.i_xy()
+        if x is None or len(x) < 2:
+            self.set_status('Need at least two points to filter.')
+            return
+        x = np.asarray(x, dtype=float)
+        i = np.asarray(i, dtype=float)
+        pair = self.is_pair()
+        if pair:
+            xq, q = self.q_xy()
+            q = np.asarray(q, dtype=float)
+            if q.shape != i.shape:
+                self.set_status('I and Q channels must have the same length.')
+                return
+            signal = i + 1j*q
+        else:
+            signal = i
+
+        ftype = self.filt_type.currentText()
+        lo = self.filt_cut_lo.value()
+        hi = self.filt_cut_hi.value()
+        sp = np.fft.fft(signal)
+        freq = np.fft.fftfreq(len(signal))     # cutoffs are fractions of f_max
+        sp = sp*self._passband_mask(freq, ftype, lo, hi)
+        out = np.fft.ifft(sp)
+
+        if pair:
+            channels = [('I', np.real(out)), ('Q', np.imag(out))]
+        else:
+            channels = [('filtered', np.real(out))]
+        used = {'Low-pass': f'hi={hi:.4g}', 'High-pass': f'lo={lo:.4g}',
+                'Band-pass': f'lo={lo:.4g}, hi={hi:.4g}'}.get(ftype, '')
+        meta = [f'Filter: {ftype} (FFT->mask->iFFT)' + (' (I & Q)' if pair else ''),
+                f'cutoff {used} x f_max']
+        self._set_result(x, channels, meta, show_source=True, xname=self._xname())
+        self.set_status(f'{ftype} filter applied ({used} ×f_max)'
+                        + (' to I & Q.' if pair else '.'))
+
+    # -------------------------------------------------------------- output
+    def plot_result(self):
+        """Push the result — and the raw source it was computed from — into a
+        keeper dock named in the Output field. The raw curve(s) are included
+        only when they share the result's x-axis (fit / smooth / phase-time);
+        for FFT / filter the source is a different domain, so it is omitted."""
+        if not self.has_result():
+            self.set_status('Nothing to plot — run an operation first.')
+            return
+        name = self.name_edit.text().strip() or 'treatment_result'
+        curves = []  # (label, x, y)
+        if self.result_show_source:
+            xi, yi = self.i_xy()
+            if xi is not None and len(xi):
+                curves.append(('raw I', xi, yi))
+            if self.is_pair():
+                xq, yq = self.q_xy()
+                if (xq is not None and len(xq)
+                        and self.q_combo.currentText() != self.i_combo.currentText()):
+                    curves.append(('raw Q', xq, yq))
+        for lbl, y in self.result_channels:
+            curves.append((lbl, self.result_x, y))
+        try:
+            for lbl, cx, cy in curves:
+                general.plot_1d(name, np.asarray(cx), np.asarray(cy),
+                                label=lbl, xname=self.result_xname)
+        except Exception as e:
+            self.set_status(f'Could not plot to GUI: {e}')
+            return
+        raw_n = sum(1 for c in curves if c[0].startswith('raw'))
+        self.set_status(f'Pushed "{name}" to the main GUI '
+                        f'({raw_n} raw + {len(self.result_channels)} result curve(s)).')
+
+    def save_result(self):
+        if not self.has_result():
+            self.set_status('Nothing to save — run an operation first.')
+            return
+        file_path = self._save_dialog(DATA_SAVE_FILTERS)
+        if not file_path:
+            return
+        cols = [self.result_x] + [np.asarray(y, dtype=float) for _, y in self.result_channels]
+        data = np.column_stack(cols)
+        col_header = f'{self.result_xname or "X"}, ' + ', '.join(lbl for lbl, _ in self.result_channels)
+        # Prepend operation metadata (fit model + params, FFT/phase settings) as
+        # comment lines, then the column header on the last line.
+        header = '\n'.join(list(self.result_meta) + [col_header])
+        self.opener.save_data(file_path, data, header=header, mode='w')
+        self.set_status(f'Saved to {os.path.basename(file_path)} '
+                        f'({len(self.result_meta)} metadata line(s), '
+                        f'{len(self.result_channels)} channel(s)).')
+
+    def _export_curves(self, mode):
+        """Curves to hand to Makie for a given mode, mirroring the preview.
+
+        Returns (xname, [(label, x, y), …]). 'raw' = source channel(s), 'result'
+        = the computed result channels, 'both' = raw + result overlaid (e.g. fit
+        over its data, which share an X axis)."""
+        curves = []
+        xi, yi = self.i_xy()
+        xq, yq = self.q_xy()
+        show_q = (self.is_pair() and xq is not None and len(xq)
+                  and self.q_combo.currentText() != self.i_combo.currentText())
+        if mode in ('raw', 'both') and xi is not None and len(xi):
+            curves.append((self.i_combo.currentText() or 'I', xi, yi))
+            if show_q:
+                curves.append((self.q_combo.currentText() or 'Q', xq, yq))
+        if mode in ('result', 'both') and self.has_result():
+            for lbl, y in self.result_channels:
+                curves.append((lbl, self.result_x, y))
+        # X-axis name: the result domain if a result curve is included, else raw
+        xname = (self.result_xname if (mode != 'raw' and self.has_result())
+                 else self._xname())
+        return xname, curves
+
+    def _write_makie_csvs(self, xname, curves):
+        """Write curves to temp CSV(s) for render.jl. Curves that share one X go
+        into a single multi-column file (clean overlay with a column legend);
+        curves with differing X (e.g. time source + frequency result) are written
+        one-per-file so render.jl overlays them as separate inputs."""
+        tmpdir = tempfile.gettempdir()
+        xs = [np.asarray(x, dtype=float) for _, x, _ in curves]
+        shared = all(len(x) == len(xs[0]) for x in xs) and \
+                 all(np.allclose(x, xs[0], equal_nan=True) for x in xs)
+        if shared:
+            cols = [xs[0]] + [np.asarray(y, dtype=float) for _, _, y in curves]
+            header = (xname or 'X') + ', ' + ', '.join(lbl for lbl, _, _ in curves)
+            path = os.path.join(tmpdir, 'atomize_makie_export.csv')
+            self.opener.save_data(path, np.column_stack(cols), header=header, mode='w')
+            return [path]
+        paths = []
+        for k, (lbl, x, y) in enumerate(curves):
+            data = np.column_stack([np.asarray(x, dtype=float), np.asarray(y, dtype=float)])
+            header = (xname or 'X') + ', ' + lbl
+            safe = ''.join(c if c.isalnum() else '_' for c in lbl)[:30] or f'curve{k}'
+            path = os.path.join(tmpdir, f'atomize_makie_{k}_{safe}.csv')
+            self.opener.save_data(path, data, header=header, mode='w')
+            paths.append(path)
+        return paths
+
+    def _makie_save_dialog(self):
+        """Save dialog for the Makie OUTPUT figure — a PDF/SVG/PNG picker, not the
+        CSV picker the Save button uses (this only chooses where the figure goes;
+        your data is never saved here)."""
+        path = self.opener.FileDialog(
+            directory=self.last_dir, mode='Save', fmt='pdf',
+            name_filters=['PDF figure (*.pdf)', 'SVG figure (*.svg)', 'PNG image (*.png)'])
+        if path and path != 'None':
+            self._remember_dir(path)
+        return path
+
+    def make_makie_figure(self):
+        """Render the selected curves to a publication PDF via Julia/Makie.
+
+        The mode selector decides what to draw (raw / result / both). Curves are
+        written to temp CSV(s) and rendered by script_examples/makie/render.jl in
+        a QProcess, so the UI stays responsive while Julia precompiles; the PDF
+        opens when done. Needs `julia` on PATH; makie/ is its own Julia project,
+        so the first render resolves + precompiles its deps (one-off, slow)."""
+        if getattr(self, '_makie_proc', None) is not None and \
+                self._makie_proc.state() != QProcess.ProcessState.NotRunning:
+            self.set_status('A Makie render is already running…')
+            return
+        mode = ['both', 'result', 'raw'][self.makie_mode.currentIndex()]
+        xname, curves = self._export_curves(mode)
+        if not curves:
+            self.set_status('Nothing to draw for that selection — load data '
+                            'or run an operation first.')
+            return
+        julia = shutil.which('julia') or os.path.expanduser('~/.juliaup/bin/julia')
+        if not os.path.exists(julia):
+            self.set_status('Julia not found — install Julia to render Makie figures.')
+            return
+        out_path = self._makie_save_dialog()
+        if not out_path or out_path == 'None':
+            return
+        out_path = str(out_path)
+        if not out_path.lower().endswith(('.pdf', '.svg', '.png')):
+            out_path += '.pdf'
+        inputs = self._write_makie_csvs(xname, curves)
+        script = Path(__file__).resolve().parent / 'makie' / 'render.jl'
+        self._makie_out = out_path
+        self._makie_proc = QProcess(self)
+        self._makie_proc.finished.connect(self._makie_done)
+        self.makie_btn.setEnabled(False)
+        self.makie_btn.setStyleSheet(BUTTON_BUSY_STYLE)
+        self.set_status(f'Rendering Makie figure ({len(curves)} curve(s))…  (first run '
+                        'precompiles CairoMakie — a few minutes; later runs ~15 s).')
+        QApplication.processEvents()
+        self._makie_proc.start(julia, [str(script), out_path, *inputs])
+
+    def _makie_done(self, code, status):
+        self.makie_btn.setEnabled(True)
+        self.makie_btn.setStyleSheet(BUTTON_STYLE)
+        out = getattr(self, '_makie_out', '')
+        if code == 0 and out and os.path.exists(out):
+            self.set_status(f'Makie figure saved to {os.path.basename(out)}.')
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(out))
+            except Exception:
+                pass
+        else:
+            try:
+                err = bytes(self._makie_proc.readAllStandardError()).decode(errors='ignore')
+            except Exception:
+                err = ''
+            self.set_status(f'Makie render failed (exit {code}). {err.strip()[-300:]}')
+
+
+def main():
+    app = QApplication(sys.argv)
+    apply_app_style(app, app_id='Atomize.ITC.DataTreatment1D', desktop='treat')
+    window = MainWindow()
+    window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    window.destroyed.connect(app.quit)
+    window.window_size = WindowSize(window, 'analysis/data_treatment/size')
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    main()

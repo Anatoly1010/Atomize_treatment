@@ -1,0 +1,3510 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Standalone DEER / PDS analysis window.
+
+Background-corrects a dipolar (DEER / PELDOR) time trace V(t) and inverts the
+dipolar kernel to a distance distribution P(r) by Tikhonov + NNLS — the same
+engine (atomize/math_modules/deer.py) that backs the DEER tab of the 1D Data
+Treatment tool, but promoted to a dedicated window with a two-plot layout:
+
+    top    — time domain: V(t), the fitted background and the model fit
+             (switchable to form factor + fit / background fit / L-curve)
+    bottom — the distance distribution P(r)
+
+Load a real V(t) directly, or a complex I/Q pair (CSV, Bruker, or the main
+window's "Send to Data Treatment" plot buffer) and zero-order-phase it to a real
+trace here. Launched as its own QProcess from the EPR Endstation Control tab,
+or run directly:  atomize-deer  (python -m atomize.treatment.deer_analysis)
+"""
+
+import os
+import sys
+from atomize.main.window_size import WindowSize
+import numpy as np
+from pathlib import Path
+
+import pyqtgraph as pg
+from pyqtgraph.dockarea import DockArea
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QComboBox, QVBoxLayout, QHBoxLayout, QDoubleSpinBox, QSpinBox,
+    QCheckBox, QFrame, QTabWidget)
+
+import atomize.general_modules.general_functions as general
+import atomize.general_modules.csv_opener_saver as openfile
+import atomize.general_modules.bruker_opener as bruker
+import atomize.math_modules.fft as fft_module
+import atomize.math_modules.deer as deer_module
+
+from atomize.main.widgets import CrosshairPlotWidget, CloseableDock
+
+# Shared dark-theme palette / widget styles (single source of truth across all
+# control-center tools); apply_app_style() pins this process to the Fusion style.
+from atomize.general_modules.gui_style import (apply_app_style,
+    BG, ACCENT, BUTTON_STYLE, LABEL_STYLE, HINT_STYLE, DSPIN_STYLE, SPIN_STYLE,
+    COMBO_STYLE, CHECKBOX_STYLE, ANALYSIS_TAB_STYLE)
+
+import atomize.general_modules.gui_forms as gui_forms
+from atomize.general_modules.gui_forms import FormPanel
+
+from atomize.treatment.paths import BUFFER_PATH, lastdir_path
+# shared with the Data Treatment tools
+LASTDIR_PATH = lastdir_path('treatment')
+
+from atomize.general_modules.gui_forms import FIELD_W, BTN_W, ACTION_W
+
+
+# Tab explanations, shown behind the '?' chip of each tab's summary line.
+_HELP_PHASE = ('Rotate the complex I/Q so the real part is the DEER trace. '
+               '"Auto" maximises the magnitude-weighted real part. Ignored for '
+               'a single real channel.')
+
+_HELP_BACKGROUND = ('Zero-time and the intermolecular background window/model '
+                    'used to correct V(t). Drag the gold (start) / blue (end) '
+                    'lines on the plot, or use the buttons.')
+
+_HELP_TIKHONOV = ('Invert the dipolar kernel to a distance distribution P(r) '
+                  '(Tikhonov + NNLS). Needs scipy.')
+
+_HELP_MELLIN = (
+    'Model-free inversion by the analytic integral <b>Mellin transform</b> '
+    '(Matveeva, Nekrasov, Maryasov, <i>PCCP</i> 2017, '
+    'doi 10.1039/C7CP04059H). No Tikhonov, no NNLS, no L-curve: the '
+    'distance distribution is recovered analytically, so it is not '
+    'broadened and bimodal peaks are not merged. Noise enters P(r) '
+    'additively and groups at <b>short r</b> (the method\'s signature), so '
+    'ripples below the reliable range are propagated noise, not structure.'
+    '<br><br>'
+    'Uses the <b>Background</b> tab\'s zero-time / window / dimension / '
+    'fit engine and the shared distance grid below the tabs. The Mellin '
+    'kernel decays to zero, so it cannot absorb a DC pedestal left by a '
+    'too-shallow background — the <b>Joint</b> background engine '
+    '(Background tab) is recommended for a clean fit.')
+
+_HELP_MULTIGAUSS = (
+    'Parametric inversion: model P(r) as a <b>sum of Gaussians</b> and fit '
+    'their centres, widths and weights — for the default Least-squares '
+    'solver jointly with the background and λ against V(t); the '
+    'Monte-Carlo solver instead fits the prepared form factor '
+    '(DeerAnalysis "Gaussian" mode / DeerLab <i>dd_gaussN</i>). When the '
+    'distribution really is a few discrete modes this is the most robust '
+    'choice and gives genuine <b>parametric error bars</b> on each peak '
+    'position and width — which the regularized and model-free engines '
+    'cannot. A poor fit (low R²) is itself diagnostic: it means the data '
+    'are not well described by a few Gaussians.'
+    '<br><br>'
+    'Uses the <b>Background</b> tab\'s zero-time / window / dimension / fit '
+    'engine and the shared distance grid below the tabs. The window feeds '
+    'the zero-time fit and, on <i>General</i> / <i>None</i> and with the '
+    'Monte-Carlo solver, the background itself; on the default '
+    'Least-squares solver with <i>Joint</i>/<i>Sequential</i> the '
+    'background is re-fitted here, so the window mainly acts through the '
+    'zero time and the starting guess.')
+
+
+def _load_last_dir():
+    try:
+        with open(LASTDIR_PATH, 'r', errors='ignore') as fh:
+            d = fh.read().strip()
+        return d if d and os.path.isdir(d) else ''
+    except Exception:
+        return ''
+
+
+def _save_last_dir(path):
+    try:
+        d = path if os.path.isdir(path) else os.path.dirname(path)
+        if d:
+            with open(LASTDIR_PATH, 'w') as fh:
+                fh.write(d)
+    except Exception:
+        pass
+
+
+# Bare SI units worth auto-prefixing on an axis ('s' -> '2 ns', not '2e-9 s');
+# already-prefixed units ('ns', 'nm') and dimensionless labels stay verbatim.
+SI_BASE_UNITS = {'s', 'hz', 'v', 'a', 'g', 't', 'k', 'm', 'ev'}
+
+
+def _si_autoprefix(unit):
+    return str(unit).strip().lower() in SI_BASE_UNITS
+
+
+def _split_unit(label):
+    """Split a 'Name (unit)' axis label into ('Name', 'unit')."""
+    s = str(label).strip()
+    if s.endswith(')') and '(' in s:
+        i = s.rfind('(')
+        return s[:i].strip(), s[i + 1:-1].strip()
+    return s, ''
+
+
+# Solid-accent "busy" variant for the Run button while an inversion is running.
+BUTTON_BUSY_STYLE = (
+    f"QPushButton {{border-radius: 4px; background-color: {ACCENT}; "
+    f"border-style: inset; color: {BG}; font-weight: bold; padding: 4px; }} "
+    f"QPushButton:disabled {{background-color: {ACCENT}; color: {BG}; }}")
+
+# Curve colours (match the Data Treatment preview convention).
+C_DATA = (120, 170, 255)     # V(t) / form factor — blue
+C_IM   = (220, 120, 220)     # imaginary (Q) channel after phasing — magenta
+C_BG   = (230, 140, 90)      # fitted background — orange
+C_FIT  = (211, 194, 78)      # model fit / P(r) / L-curve — gold
+C_BAND = (125, 220, 125)     # noise band of the smoothed residual — green
+
+
+class _DeerWorker(QThread):
+    """Runs one DEER inversion (optionally zero-time fit + validation) off the GUI
+    thread. The work is pure numpy/scipy (the heavy NNLS/least-squares releases the
+    GIL), so the window stays responsive during the ~10-60 s joint fit. `fn` is a
+    closure that captures plain values only (no Qt widgets); its return value — or
+    the Exception it raised — is delivered to the main thread via `done`."""
+    done = pyqtSignal(object)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self._fn())
+        except Exception as e:                    # surfaced on the main thread
+            self.done.emit(e)
+
+
+class MainWindow(QMainWindow):
+
+    # time-unit -> factor that converts the X axis into microseconds (kernel unit)
+    DEER_TUNITS = {'µs': 1.0, 'ns': 1e-3, 'ms': 1e3}
+    # plausible DEER trace length in µs, for guessing the unit of a file with none
+    DEER_TSPAN_US = (0.05, 50.0)
+
+    def __init__(self, *args, **kwargs):
+        super(MainWindow, self).__init__(*args, **kwargs)
+
+        if len(sys.argv) > 1:
+            self.test_flag = sys.argv[1]
+        else:
+            self.test_flag = 'None'
+
+        self.opener = openfile.Saver_Opener()
+        self.bruker = bruker.Bruker_Opener()
+        self.fft = fft_module.Fast_Fourier()
+
+        # name -> {channel label: (x, y)} for every loaded file/trace; the trace
+        # selector picks one as active and copies it into self.datasets
+        self.traces = {}
+        # channel label -> (x, y) of the *active* trace's source curves
+        self.datasets = {}
+        # phased real trace (x, V) fed to the inversion — the DEER input
+        self.real_xy = (None, None)
+        # phased imaginary trace (Q after rotation), shown alongside V(t) so the
+        # zero-order phase can be tuned to push all signal into the real part;
+        # None for a single real channel
+        self.imag_y = None
+
+        # DEER/PDS state: last full result dict + validation ensemble
+        self.deer_result = None
+        self.deer_band = None
+        self.batch_results = None          # last 'Process all' per-trace results
+        self._batch_mode = False           # True while the per-trace overlay is shown
+        self._batch_band_items = {}        # name -> (lo, hi, fill) per-trace CI bands
+        self.batch_table = None            # last 'Process all' summary table
+        # P(r) validation band items (on the bottom plot)
+        self._band_lo = self._band_hi = self._band_fill = None
+        # green/yellow/red distance-reliability zones (on the bottom plot)
+        self._reliab_regions = None
+        # draggable background start/end cursors + L-curve marker (top plot)
+        self._bg_cursor = None
+        self._bg_cursor_end = None
+        self._t0_cursor = None            # zero-time marker (top plot)
+        self._lcurve_marker = None
+        self._suppress_cursor = False     # guard against cursor<->spinbox echo
+        self._suppress_live = False
+        # background-thread state for the (slow) inversion
+        self._deer_worker = None          # keep a ref so a running QThread is not GC'd
+        self._deer_busy = False
+        self._deer_pending = False        # a request arrived mid-run -> re-run once
+
+        # persistent curve items per plot (label -> PlotDataItem), reused via
+        # setData so live updates never tear down / rebuild plot items
+        self._time_items = {}
+        self._pr_items = {}
+        self._time_key = None
+        self._pr_key = None
+
+        self.last_dir = _load_last_dir()
+
+        self.design()
+        self.load_from_buffer(silent=True)
+
+    # ----------------------------------------------------------------- UI
+    def design(self):
+        self.setWindowTitle('DEER / PDS Analysis')
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'gui', 'icon_deer.ico')
+        self.setWindowIcon(QIcon(icon_path))
+        self.setMinimumHeight(740)
+        self.setMinimumWidth(1090)
+        self.resize(1270, 820)
+        # background on the QMainWindow (not the central widget) so spinboxes
+        # keep their full native frame
+        self.setStyleSheet(f"background-color: {BG};")
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setSpacing(gui_forms.PANEL_GAP)
+
+        # Two stacked plots on the left, controls on the right.
+        root.addWidget(self._build_plots(), stretch=1)
+
+        root.addWidget(gui_forms.vline())
+
+        root.addWidget(self._build_controls(), stretch=0)
+
+        gui_forms.apply_row_metrics(self)
+
+    def _build_plots(self):
+        # Two CrosshairPlotWidgets stacked in one DockArea (atomize/main/widgets):
+        # the time trace on top, P(r) below. No setBackground — inherit
+        # pyqtgraph's global background set in widgets.py. Close buttons hidden
+        # (the docks are the only plots and must not be dismissable).
+        pg.setConfigOptions(antialias=True)
+        self.plot_area = DockArea()
+
+        self.p_time = CrosshairPlotWidget()
+        self.p_time.showGrid(x=True, y=True, alpha=0.2)
+        self.p_time.setLabel('bottom', 'Time', units='s')
+        # nudge the legend left of the right edge so it clears the (right-side)
+        # background-end cursor line
+        self.time_legend = self.p_time.addLegend(offset=(-55, 10))
+        dock_time = CloseableDock(name='Time domain', widget=self.p_time)
+        dock_time.close_button.hide()
+
+        self.p_pr = CrosshairPlotWidget()
+        self.p_pr.showGrid(x=True, y=True, alpha=0.2)
+        self.p_pr.setLabel('bottom', 'Distance', units='nm')
+        self.p_pr.setLabel('left', 'P(r)')
+        self.pr_legend = self.p_pr.addLegend(offset=(-10, 10))
+        dock_pr = CloseableDock(name='Distance distribution P(r)', widget=self.p_pr)
+        dock_pr.close_button.hide()
+
+        self.plot_area.addDock(dock_time, 'top')
+        self.plot_area.addDock(dock_pr, 'bottom', dock_time)
+
+        # click-to-pick alpha on the L-curve view (single-click; the crosshair
+        # toggle uses double-click, so the two don't conflict)
+        self.p_time.scene().sigMouseClicked.connect(self._on_lcurve_click)
+        return self.plot_area
+
+    # ---- small widget helpers (mirror the Data Treatment tools) ----
+    def _label(self, text):
+        return gui_forms.label(text)
+
+    def _hline(self):
+        return gui_forms.hline()
+
+    def _build_controls(self):
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(*gui_forms.PANEL_MARGINS)
+        outer.setSpacing(8)
+        tabs = QTabWidget()
+        self.deer_tabs = tabs                  # queried by "Process all" for the engine
+        tabs.setStyleSheet(ANALYSIS_TAB_STYLE)
+        tabs.addTab(self._scroll(self._build_source_tab()), 'Source')
+        tabs.addTab(self._scroll(self._build_phase_tab()), 'Phase')
+        tabs.addTab(self._scroll(self._build_background_tab()), 'Background')
+        tabs.addTab(self._scroll(self._build_deer_tab()), 'Tikhonov')
+        tabs.addTab(self._scroll(self._build_mellin_tab()), 'Mellin')
+        tabs.addTab(self._scroll(self._build_gauss_tab()), 'Multi-Gaussian')
+        outer.addWidget(tabs, stretch=1)
+
+        # Shared inversion controls (distance grid + top-plot view) used by ALL
+        # inversion engines (Tikhonov / Mellin / Multi-Gaussian), kept always
+        # visible below the tabs so no tab has to be left to set them.
+        outer.addWidget(self._hline())
+        outer.addWidget(self._build_shared_controls())
+
+        # Status line lives below the tabs so it is always visible.
+        self.status = QLabel('Load a V(t) trace to begin.')
+        self.status.setStyleSheet(LABEL_STYLE)
+        self.status.setWordWrap(True)
+        outer.addWidget(self.status)
+        # Wide enough for all six tab labels to sit on one row (Source / Phase /
+        # Background / Tikhonov / Mellin / Multi-Gaussian); narrower than this and
+        # the tab bar overflows into left/right scroll buttons.
+        container.setFixedWidth(570)
+        return container
+
+    def _build_shared_controls(self):
+        """Distance grid (min / max / points) and the top-plot view selector —
+        shared by the Tikhonov (DEER) and Mellin engines, so they live in an
+        always-visible strip below the tabs rather than inside one engine's tab."""
+        p = FormPanel(margins=(0, 4, 0, 0))
+        # One 4-column grid for the whole strip: labels in column 0, the distance
+        # pair and Auto one per column, and the wider items spanning two columns.
+        g = gui_forms.equal_grid(4)
+        p.add_layout(g)
+
+        self.deer_rmin = QDoubleSpinBox()
+        self.deer_rmin.setStyleSheet(DSPIN_STYLE)
+        self.deer_rmin.setRange(0.5, 50.0); self.deer_rmin.setDecimals(2)
+        self.deer_rmin.setSingleStep(0.1); self.deer_rmin.setValue(1.5)
+        self.deer_rmin.setSuffix(' nm')
+        self.deer_rmin.valueChanged.connect(self._live_update)
+        self.deer_rmin.valueChanged.connect(self._mellin_live)
+        self.deer_rmin.valueChanged.connect(self._gauss_live)
+        self.deer_rmax = QDoubleSpinBox()
+        self.deer_rmax.setStyleSheet(DSPIN_STYLE)
+        self.deer_rmax.setRange(0.5, 50.0); self.deer_rmax.setDecimals(2)
+        self.deer_rmax.setSingleStep(0.1); self.deer_rmax.setValue(8.0)
+        self.deer_rmax.setSuffix(' nm')
+        self.deer_rmax.valueChanged.connect(self._live_update)
+        self.deer_rmax.valueChanged.connect(self._mellin_live)
+        self.deer_rmax.valueChanged.connect(self._gauss_live)
+        btn_autorange = QPushButton('Auto')
+        btn_autorange.setStyleSheet(BUTTON_STYLE)
+        btn_autorange.setToolTip(
+            'Set the reliable distance window the data support:\n'
+            '• min ≈ (4·NU_DD·Δt)^⅓ nm — shortest distance whose dipolar '
+            'oscillation the time step Δt still samples (Nyquist).\n'
+            '• max ≈ 5·(t_max/2)^⅓ nm — longest distance the trace length '
+            'supports (DeerAnalysis/Jeschke rule). Only the MEAN is recoverable '
+            'near this limit, and it is biased short as the limit is approached '
+            '— see the reliability-shading tooltip.\n'
+            'Both are set automatically on load; mass outside this window is '
+            'not constrained by the data.')
+        btn_autorange.clicked.connect(self._auto_rrange)
+        g.addWidget(gui_forms.label('Distance min/max'), 0, 0)
+        g.addWidget(self.deer_rmin, 0, 1)
+        g.addWidget(self.deer_rmax, 0, 2)
+        g.addWidget(gui_forms.row_button(btn_autorange), 0, 3)
+
+        self.deer_rn = QSpinBox()
+        self.deer_rn.setStyleSheet(SPIN_STYLE)
+        self.deer_rn.setRange(20, 2000); self.deer_rn.setValue(200)
+        self.deer_rn.valueChanged.connect(self._live_update)
+        self.deer_rn.valueChanged.connect(self._mellin_live)
+        self.deer_rn.valueChanged.connect(self._gauss_live)
+        g.addWidget(gui_forms.label('Distance points'), 1, 0)
+        g.addWidget(self.deer_rn, 1, 1)
+
+        self.deer_show = QComboBox()
+        self.deer_show.setStyleSheet(COMBO_STYLE)
+        self.deer_show.addItems(['V(t) + background + fit', 'Form factor + fit',
+                                 'Background fit', 'Residual', 'Residual ACF',
+                                 'L-curve'])
+        self.deer_show.setToolTip(
+            'Top-plot view (the L-curve view applies to the Tikhonov engine '
+            'only). In the Residual view the samples before t₀ are drawn as a '
+            'separate curve: no engine fits below the zero time, and the model '
+            'is exactly even in t, so what is shown there is the fitted curve '
+            'read at |t|. A real echo is never exactly even about t₀, and that '
+            'asymmetry — not the inversion — is what that curve mostly measures. '
+            'Two noise bands are drawn, one per curve: ±σ judges the raw '
+            'residual, ±σ/√w the smoothed one, w being the boxcar width. Judge '
+            'each curve against its own band — the smoothed curve averages w '
+            'points, so ±σ is √w too wide for it.')
+        self.deer_show.currentIndexChanged.connect(self._deer_rerender)
+        g.addWidget(gui_forms.label('Show'), 2, 0)
+        g.addWidget(self.deer_show, 2, 1, 1, 2)
+
+        # Uncertainty options shared by both engines.
+        self.deer_ci_chk = QCheckBox('95% uncertainty band')
+        self.deer_ci_chk.setStyleSheet(CHECKBOX_STYLE)
+        self.deer_ci_chk.setChecked(True)
+        self.deer_ci_chk.setToolTip(
+            'Shade the 95% uncertainty band on P(r). Tikhonov: propagates the '
+            'NOISE only — the regularization bias is excluded, so the band '
+            'under-covers at the peaks (measured ~84% at the GCV α, ~8% at α×2, '
+            '~0% at α×3) and is 1.6–3.6× narrower than DeerLab\'s; with the joint '
+            'engine it also holds the background and λ fixed, which makes it up '
+            'to 7× narrower again. Read it as a noise scale, not a confidence '
+            'interval. Mellin: Monte-Carlo band from re-inverting the form factor '
+            'with the decayed-tail noise of V (not the fit residual), holding the '
+            'fitted background, λ, τmax and δ fixed — so it under-covers too '
+            '(measured 78–91% against a nominal 95%, worse at small τmax) and it '
+            'is centred on a possibly biased density, which no widening would '
+            'fix. Multi-Gaussian: parametric band from the '
+            'fit-covariance of the component parameters. For a coverage-honest '
+            'interval use Validate, whose band supersedes this one.')
+        self.deer_ci_chk.stateChanged.connect(self._ci_toggled)
+        g.addWidget(self.deer_ci_chk, 3, 0, 1, 2)
+
+        self.deer_reliab_chk = QCheckBox('Reliability on P(r)')
+        self.deer_reliab_chk.setStyleSheet(CHECKBOX_STYLE)
+        self.deer_reliab_chk.setChecked(True)
+        self.deer_reliab_chk.setToolTip(
+            'Shade the P(r) distance axis by the DeerAnalysis reliability ranges '
+            'set by the dipolar evolution time t_max (DeerLab/DeerAnalysis '
+            'convention, r in nm, t_max in µs):\n'
+            '  green  — shape reliable, r ≤ 3·(t_max/2)^⅓\n'
+            '  yellow — MEAN reliable, r ≤ 5·(t_max/2)^⅓; the WIDTH is NOT '
+            'recoverable in this band, and the mean degrades towards its top\n'
+            '  red    — beyond the trace-supported range (unreliable).\n'
+            'The yellow band is more optimistic than its name suggests. Measured '
+            'on a narrow (σ_r 0.25 nm) 5.0 nm distribution over 20 noise draws: at '
+            '83 % of the yellow limit the mean is good to ±0.07 nm, but at 93 % it '
+            'is biased SHORT by 0.15–0.29 nm — systematically, and a perfect zero '
+            'time does not fix it. There the inversion returns a spike ~3x too '
+            'tall rather than a broadened peak, because the kernel columns across '
+            'that distance range are nearly collinear over the available t_max. '
+            'Trust the mean in the lower part of the yellow band, not near its '
+            'edge, and do not read a width from it at all.')
+        self.deer_reliab_chk.stateChanged.connect(self._deer_rerender)
+        g.addWidget(self.deer_reliab_chk, 4, 0, 1, 2)
+
+        self.deer_validate_chk = QCheckBox('Validate P(r) band')
+        self.deer_validate_chk.setStyleSheet(CHECKBOX_STYLE)
+        self.deer_validate_chk.setToolTip(
+            'Re-run the inversion over a sweep of background-start times and show '
+            'the median P(r) with a 5–95% uncertainty band (DeerAnalysis-style). '
+            'Works for the Tikhonov, Mellin and Multi-Gaussian engines.')
+        self.deer_validate_chk.stateChanged.connect(self._live_update)
+        self.deer_validate_chk.stateChanged.connect(self._mellin_live)
+        self.deer_validate_chk.stateChanged.connect(self._gauss_live)
+        g.addWidget(self.deer_validate_chk, 5, 0, 1, 2)
+
+        # Batch: run one engine over every loaded trace and overlay the results.
+        # Kept here (always visible) with its own engine picker so it does not
+        # depend on which tab is open.
+        self.batch_engine = QComboBox()
+        self.batch_engine.setStyleSheet(COMBO_STYLE)
+        self.batch_engine.addItems(['Tikhonov', 'Mellin', 'Multi-Gaussian'])
+        self.batch_engine.setToolTip('Inversion engine used by "Process all traces".')
+        self.process_all_btn = QPushButton('Process all traces')
+        self.process_all_btn.setStyleSheet(BUTTON_STYLE)
+        self.process_all_btn.setToolTip(
+            'Run the chosen engine on every loaded trace with the current '
+            'parameters and overlay the results: P(r) on the bottom plot, the '
+            'top-plot quantity (Show) on top, one colour per trace.')
+        self.process_all_btn.clicked.connect(self.process_all)
+        self.batch_save_btn = QPushButton('Save batch…')
+        self.batch_save_btn.setStyleSheet(BUTTON_STYLE)
+        self.batch_save_btn.setToolTip('Save the per-trace summary table and all '
+                                       'P(r) curves as CSV.')
+        self.batch_save_btn.clicked.connect(self.save_batch)
+        self.batch_save_btn.setEnabled(False)
+        g.addWidget(gui_forms.hline(), 6, 0, 1, 4)
+        g.addWidget(gui_forms.label('Process all'), 7, 0)
+        g.addWidget(self.batch_engine, 7, 1)
+        g.addWidget(gui_forms.row_button(self.process_all_btn), 7, 2)
+        g.addWidget(gui_forms.row_button(self.batch_save_btn), 7, 3)
+        return p
+
+    def _ci_toggled(self, *args):
+        """Confidence-band checkbox: Tikhonov keeps its CI in the result so a
+        re-render suffices; the Mellin CI is a Monte-Carlo pass computed only when
+        requested, so toggling it on needs a re-inversion."""
+        if self._batch_mode and self.batch_results:
+            # in batch mode: turning CI on needs a recompute (MC bands); turning
+            # it off just drops the bands from the overlay
+            if self.deer_ci_chk.isChecked():
+                self.process_all()
+            else:
+                self._render_batch(self.batch_results)
+            return
+        if self.deer_result is None:
+            return
+        eng = self.deer_result.get('engine', '')
+        if eng.startswith('mellin') and self.real_xy[0] is not None:
+            self.do_mellin()                     # MC band: needs a re-inversion
+        elif eng == 'gauss' and self.real_xy[0] is not None:
+            self.do_gauss()                       # parametric band: re-inversion
+        else:
+            self._render()
+
+    def _scroll(self, inner):
+        """Wrap a tab's content in a scroll area so it never clips on a short
+        window."""
+        return gui_forms.scroll_wrap(inner)
+
+    # ---- Tab 1: Source (load / channels / trim) ----
+    def _build_source_tab(self):
+        p = FormPanel(field_width=FIELD_W, button_width=BTN_W)
+        src_btns = []
+        for text, slot in (('Open CSV / HDF5…', self.open_csv),
+                           ('Open Bruker…', self.open_bruker),
+                           ('Load from plot', lambda: self.load_from_buffer(silent=False)),
+                           ('Clear', self.clear_all)):
+            btn = QPushButton(text)
+            btn.setStyleSheet(BUTTON_STYLE)
+            btn.clicked.connect(slot)
+            src_btns.append(btn)
+        # one 4-column grid so Remove is exactly as wide as Clear
+        src_grid = gui_forms.equal_grid(4)
+        for i, b in enumerate(src_btns):
+            src_grid.addWidget(b, 0, i)
+        p.add_layout(src_grid)
+
+        # trace selector: each opened file (or plot load) is one trace; the combo
+        # picks which one is active and feeds the phase -> inversion pipeline.
+        self.trace_combo = QComboBox()
+        self.trace_combo.setStyleSheet(COMBO_STYLE)
+        self.trace_combo.setToolTip('Active trace. Open several files to compare; '
+                                    'each becomes a selectable trace here.')
+        self.trace_combo.currentIndexChanged.connect(self._activate_trace)
+        self.trace_remove_btn = QPushButton('Remove')
+        self.trace_remove_btn.setStyleSheet(BUTTON_STYLE)
+        self.trace_remove_btn.setToolTip('Remove the active trace from the list.')
+        self.trace_remove_btn.clicked.connect(self._remove_trace)
+        trace_cell = QHBoxLayout()
+        trace_cell.setContentsMargins(0, 0, 0, 0)
+        trace_cell.setSpacing(8)
+        trace_cell.addWidget(gui_forms.label('Trace'))
+        trace_cell.addWidget(self.trace_combo, 1)
+        src_grid.addLayout(trace_cell, 1, 0, 1, 3)
+        src_grid.addWidget(gui_forms.row_button(self.trace_remove_btn), 1, 3)
+
+        self.loaded_label = QLabel('File: —')
+        self.loaded_label.setStyleSheet(HINT_STYLE)
+        self.loaded_label.setWordWrap(True)
+        p.add_widget(self.loaded_label)
+
+        self.i_combo = QComboBox()
+        self.i_combo.setStyleSheet(COMBO_STYLE)
+        self.i_combo.currentIndexChanged.connect(self.on_source_changed)
+        p.add_row('I / primary', self.i_combo,
+                  tooltip='Channel used as the real V(t).')
+        self.q_combo = QComboBox()
+        self.q_combo.setStyleSheet(COMBO_STYLE)
+        self.q_combo.currentIndexChanged.connect(self.on_source_changed)
+        p.add_row('Q channel', self.q_combo)
+
+        self.pair_check = QCheckBox('I/Q pair')
+        self.pair_check.setStyleSheet(CHECKBOX_STYLE)
+        self.pair_check.setToolTip('Treat I and Q as one complex trace and phase '
+                                   'it to a real V(t) on the Phase tab.')
+        self.pair_check.stateChanged.connect(self.on_source_changed)
+        p.add_widget(self.pair_check)
+
+        # Trim: discard leading/trailing points before phasing/inversion
+        self.trim_start = QSpinBox()
+        self.trim_start.setStyleSheet(SPIN_STYLE)
+        self.trim_start.setRange(0, 10**7)
+        self.trim_start.setSuffix(' pts')
+        self.trim_start.setToolTip('Discard this many points from the start of the '
+                                   'trace (e.g. dead-time / rising edge) before phasing.')
+        self.trim_start.valueChanged.connect(self._trim_changed)
+        self.trim_end = QSpinBox()
+        self.trim_end.setStyleSheet(SPIN_STYLE)
+        self.trim_end.setRange(0, 10**7)
+        self.trim_end.setSuffix(' pts')
+        self.trim_end.setToolTip('Discard this many points from the end of the trace '
+                                 '(e.g. a corrupted tail) before phasing.')
+        self.trim_end.valueChanged.connect(self._trim_changed)
+        p.add_row('Trim start/end', self.trim_start, self.trim_end)
+        p.add_stretch()
+        return p
+
+    # ---- Tab 2: Phase (zero-order) ----
+    def _build_phase_tab(self):
+        p = FormPanel(field_width=FIELD_W, button_width=BTN_W)
+        p.add_title('Rotate the I/Q pair to a real V(t)', help=_HELP_PHASE)
+
+        self.phase_zero = QDoubleSpinBox()
+        self.phase_zero.setStyleSheet(DSPIN_STYLE)
+        self.phase_zero.setRange(0.0, 360.0)
+        self.phase_zero.setDecimals(2)
+        self.phase_zero.setSingleStep(0.5)
+        self.phase_zero.setSuffix(' deg')
+        self.phase_zero.setWrapping(True)
+        self.phase_zero.valueChanged.connect(self._phase_changed)
+        btn_autoph = QPushButton('Auto')
+        btn_autoph.setStyleSheet(BUTTON_STYLE)
+        btn_autoph.clicked.connect(self.auto_phase_zero)
+        p.add_row('Phase φ₀', self.phase_zero, btn_autoph, stretch=[3, 1])
+        p.add_stretch()
+        return p
+
+    # ---- Tab 3: Background (zero-time + intermolecular background) ----
+    def _build_background_tab(self):
+        p = FormPanel(field_width=FIELD_W, button_width=BTN_W)
+        p.add_title('Zero time and the intermolecular background',
+                    help=_HELP_BACKGROUND)
+
+        self.deer_tunit = QComboBox()
+        self.deer_tunit.setStyleSheet(COMBO_STYLE)
+        self.deer_tunit.addItems(list(self.DEER_TUNITS.keys()))
+        self.deer_tunit.currentIndexChanged.connect(self._unit_changed)
+        p.add_row('Time unit', self.deer_tunit)
+
+        self.deer_t0 = QDoubleSpinBox()
+        self.deer_t0.setStyleSheet(DSPIN_STYLE)
+        self.deer_t0.setRange(-1e9, 1e9)
+        self.deer_t0.setDecimals(4)
+        self.deer_t0.setSingleStep(0.05)
+        self.deer_t0.setValue(0.0)
+        self.deer_t0.valueChanged.connect(self._live_update)
+        btn_t0 = QPushButton('Max')
+        btn_t0.setStyleSheet(BUTTON_STYLE)
+        btn_t0.clicked.connect(self._deer_t0_max)
+        self.deer_fit_t0 = QCheckBox('Fit')
+        self.deer_fit_t0.setStyleSheet(CHECKBOX_STYLE)
+        self.deer_fit_t0.setChecked(True)
+        self.deer_fit_t0.setToolTip(
+            'Automatically fit the zero-time (dipolar reference time) by '
+            'minimizing the fit residual before inverting — the equivalent of '
+            "DeerLab's reftime. A wrong t0 broadens P(r) and biases it long, so "
+            'this matters more than the background depth. Uncheck to set t0 '
+            'manually (spin box / Max).')
+        self.deer_fit_t0.stateChanged.connect(self._live_update)
+        p.add_row('Zero time t₀', self.deer_t0, btn_t0, self.deer_fit_t0,
+                  stretch=[3, 1, 1])
+
+        self.deer_bgstart = QDoubleSpinBox()
+        self.deer_bgstart.setStyleSheet(DSPIN_STYLE)
+        self.deer_bgstart.setRange(-1e9, 1e9)
+        self.deer_bgstart.setDecimals(4)
+        self.deer_bgstart.setSingleStep(0.05)
+        self.deer_bgstart.valueChanged.connect(self._live_update)
+        btn_autobg = QPushButton('Auto')
+        btn_autobg.setStyleSheet(BUTTON_STYLE)
+        btn_autobg.setToolTip(
+            'Place the background start where the dipolar modulation has decayed '
+            '(end of the last stretch with a significant oscillation envelope). '
+            'Set automatically on load; click to re-estimate.')
+        btn_autobg.clicked.connect(self._auto_bg_start)
+        p.add_row('Background start', self.deer_bgstart, btn_autobg,
+                  stretch=[3, 1])
+
+        self.deer_bgend = QDoubleSpinBox()
+        self.deer_bgend.setStyleSheet(DSPIN_STYLE)
+        self.deer_bgend.setRange(-1e9, 1e9)
+        self.deer_bgend.setDecimals(4)
+        self.deer_bgend.setSingleStep(0.05)
+        self.deer_bgend.setValue(0.0)            # 0 / ≤ start ⇒ no upper limit
+        self.deer_bgend.valueChanged.connect(self._live_update)
+        btn_end = QPushButton('End')
+        btn_end.setStyleSheet(BUTTON_STYLE)
+        btn_end.clicked.connect(self._deer_bgend_max)
+        p.add_row('Background end', self.deer_bgend, btn_end, stretch=[3, 1])
+
+        self.deer_dim = QDoubleSpinBox()
+        self.deer_dim.setStyleSheet(DSPIN_STYLE)
+        self.deer_dim.setRange(1.0, 6.0)
+        self.deer_dim.setDecimals(2)
+        self.deer_dim.setSingleStep(0.1)
+        self.deer_dim.setValue(3.0)
+        self.deer_dim.valueChanged.connect(self._live_update)
+        self.deer_fitdim = QCheckBox('fit')
+        self.deer_fitdim.setStyleSheet(CHECKBOX_STYLE)
+        self.deer_fitdim.stateChanged.connect(self._live_update)
+        p.add_row('Background dim.', self.deer_dim, self.deer_fitdim,
+                  stretch=[3, 1])
+
+        self.deer_engine = QComboBox()
+        self.deer_engine.setStyleSheet(COMBO_STYLE)
+        self.deer_engine.addItems(['Sequential', 'Joint (global)',
+                                   'None (no background)',
+                                   'General (a·exp[b(t+c·dᵗ)])'])
+        self.deer_engine.setCurrentIndex(1)            # Joint (global) is the default
+        self.deer_engine.setToolTip(
+            'Sequential: fit the background on the tail window, divide it out, '
+            'then invert (fast).\nJoint (global): fit background + modulation '
+            'depth together with P(r) in one pass (DeerLab-style) — more robust '
+            'when the background window is short, shallow, or hard to place, and required '
+            'for a clean Mellin fit. Default.\nNone (no background): B(t)=1, fit '
+            'only the modulation depth λ. For pre-corrected / simulated / '
+            'full-modulation (λ→1) data that has NO background — fitting a decay '
+            'there would absorb the dipolar decay and badly broaden P(r).\n'
+            'General (a·exp[b(t+c·dᵗ)]): flexible empirical background — the four '
+            'parameters a, b, c, d are free — fit on the tail window like '
+            'Sequential. Use when the intermolecular decay is not a stretched '
+            'exponential; needs a clean (well-decayed) tail, since its extra '
+            'freedom will otherwise chase residual modulation.')
+        self.deer_engine.currentIndexChanged.connect(self._live_update)
+        self.deer_engine.currentIndexChanged.connect(self._mellin_live)
+        self.deer_engine.currentIndexChanged.connect(self._gauss_live)
+        self.deer_engine.currentIndexChanged.connect(self._general_params_update)
+        p.add_row('Background fit', self.deer_engine)
+
+        adv = p.add_advanced()
+
+        self.deer_echo_head = QCheckBox('Parabolic echo-top head')
+        self.deer_echo_head.setStyleSheet(CHECKBOX_STYLE)
+        self.deer_echo_head.setToolTip(
+            'Denoise the echo top by replacing it with a smooth parabola fitted to '
+            'the trace\'s even part about the zero time. The signal is symmetric '
+            'about t₀, so this even fit describes the echo top with far fewer '
+            'parameters than there are samples — cleaning up the highest-leverage '
+            'part of the trace before inversion.\n'
+            'A guard skips the head when the distribution is too broad for a simple '
+            'parabola to represent (a broad P(r) has an echo top set by its '
+            'shortest distances, which one parabola cannot stand in for).\n'
+            'Works with the Joint background only, and needs samples before the '
+            'zero time (the mirrored pairs are what make the fit unbiased). Off by '
+            'default: it adds a regularization scan and helps mainly at higher '
+            'noise.')
+        self.deer_echo_head.stateChanged.connect(self._live_update)
+        self.deer_engine.currentIndexChanged.connect(self._echo_head_update)
+        self._echo_head_update()
+        adv.add_widget(self.deer_echo_head)
+
+        # General-background coefficients g(t) = a·exp(b·(t + c·dᵗ)), one per row.
+        # Auto (default) fits all four and writes the fitted values back here;
+        # uncheck Auto to set them by hand (used directly as the background, no
+        # fitting). Only active for the General background model.
+        self.gbg_auto = QCheckBox('Auto (fit)')
+        self.gbg_auto.setStyleSheet(CHECKBOX_STYLE)
+        self.gbg_auto.setChecked(True)
+        self.gbg_auto.setToolTip(
+            'Auto: fit a, b, c, d on the tail window and show the result below. '
+            'Uncheck to set the four coefficients by hand — they are then used '
+            'directly as the background g(t) = a·exp(b·(t + c·dᵗ)) (no fitting). '
+            'Only used by the General background model.')
+        self.gbg_auto.stateChanged.connect(self._general_params_update)
+        self.gbg_auto.stateChanged.connect(self._live_update)
+        self.gbg_auto.stateChanged.connect(self._mellin_live)
+        self.gbg_auto.stateChanged.connect(self._gauss_live)
+        adv.add_row('General bg', self.gbg_auto,
+                    gui_forms.hint('a·exp[b(t + c·dᵗ)]'), stretch=[1, 2])
+
+        # ranges are wide so the boxes hold whatever the fit returns (the model can
+        # be over-parametrized for a gentle decay), keeping the auto→manual hand-off
+        # exact. In g = a·exp(b·(t + c·dᵗ)): a is the amplitude (sets λ), b the
+        # decay rate in the exponent, c the weight of the dᵗ term, d its base.
+        self.gbg_a = QDoubleSpinBox(); self.gbg_b = QDoubleSpinBox()
+        self.gbg_c = QDoubleSpinBox(); self.gbg_d = QDoubleSpinBox()
+        self._gbg_rows = FormPanel(label_width=adv.label_width, field_width=FIELD_W)
+        for sp, name, lo, hi, dec, val, tip in (
+                (self.gbg_a, 'a (amplitude)', 1e-4, 1e4, 4, 0.6,
+                    'a — amplitude; sets the t=0 background level g(0)=a·exp(b·c) '
+                    'and hence λ. Cancels in the background SHAPE B=g/g(0).'),
+                (self.gbg_b, 'b (rate)',     -1e3, 1e3, 5, -0.05,
+                    'b — decay rate in the exponent (per µs); negative = decaying'),
+                (self.gbg_c, 'c (dᵗ weight)', -1e4, 1e4, 4, 0.0,
+                    'c — weight of the dᵗ term inside the exponent'),
+                (self.gbg_d, 'd (dᵗ base)',   1e-4, 1.0, 4, 0.8,
+                    'd — base of the dᵗ term, 0<d≤1 (decaying)')):
+            sp.setStyleSheet(DSPIN_STYLE)
+            sp.setRange(lo, hi); sp.setDecimals(dec); sp.setValue(val)
+            sp.setSingleStep(0.01); sp.setToolTip(tip)
+            sp.valueChanged.connect(self._live_update)
+            sp.valueChanged.connect(self._mellin_live)
+            sp.valueChanged.connect(self._gauss_live)
+            self._gbg_rows.add_row(name, sp, tooltip=tip)
+        adv.add_widget(self._gbg_rows)
+
+        p.add_stretch()
+        self._general_params_update()
+        return p
+
+    def _general_params_update(self, *args):
+        """Enable the General-background coefficient boxes only when that model is
+        selected, and only let them be edited when Auto (fit) is off."""
+        is_general = self.deer_engine.currentIndex() == 3
+        auto = self.gbg_auto.isChecked()
+        self.gbg_auto.setEnabled(is_general)
+        for sp in (self.gbg_a, self.gbg_b, self.gbg_c, self.gbg_d):
+            sp.setEnabled(is_general and not auto)
+        self._gbg_rows.setVisible(is_general and not auto)
+
+    def _echo_head_update(self, *args):
+        """The parabolic head is only implemented on the Joint background, where
+        `_tikhonov_compute` drops it under the other three models. Grey the box out
+        there instead of leaving a tick that does nothing."""
+        joint = self.deer_engine.currentIndex() == 1
+        self.deer_echo_head.setEnabled(joint)
+
+    def _general_bg_params(self):
+        """bg_params dict for the General background: None when auto-fitting,
+        else the hand-set {a, b, c, d, fit=False} used directly."""
+        if self.deer_engine.currentIndex() != 3 or self.gbg_auto.isChecked():
+            return None
+        return {'a': float(self.gbg_a.value()), 'b': float(self.gbg_b.value()),
+                'c': float(self.gbg_c.value()), 'd': float(self.gbg_d.value()),
+                'fit': False}
+
+    # ---- Tab 4: Tikhonov inversion ----
+    def _build_deer_tab(self):
+        p = FormPanel(field_width=FIELD_W, button_width=BTN_W)
+        p.add_title('Invert to P(r) by Tikhonov + NNLS', help=_HELP_TIKHONOV)
+
+        self.deer_alpha_auto = QCheckBox('Auto (GCV)')
+        self.deer_alpha_auto.setStyleSheet(CHECKBOX_STYLE)
+        self.deer_alpha_auto.setToolTip(
+            'Choose the regularization weight automatically by generalized '
+            'cross-validation (robust against the spiky P(r) the L-curve corner '
+            'gives on DEER data). Uncheck to set α manually, or pick it on the '
+            'L-curve view.')
+        self.deer_alpha_auto.setChecked(True)
+        self.deer_alpha_auto.stateChanged.connect(self._deer_alpha_toggle)
+        self.deer_alpha_auto.stateChanged.connect(self._live_update_tikhonov)
+        self.deer_alpha = QDoubleSpinBox()
+        self.deer_alpha.setStyleSheet(DSPIN_STYLE)
+        self.deer_alpha.setRange(1e-4, 1e4); self.deer_alpha.setDecimals(4)
+        self.deer_alpha.setSingleStep(0.1); self.deer_alpha.setValue(1.0)
+        self.deer_alpha.setEnabled(False)
+        self.deer_alpha.valueChanged.connect(self._live_update_tikhonov)
+        p.add_row('Regularization α', self.deer_alpha, self.deer_alpha_auto)
+
+        self.deer_alpha_factor = QDoubleSpinBox()
+        self.deer_alpha_factor.setStyleSheet(DSPIN_STYLE)
+        self.deer_alpha_factor.setRange(0.1, 50.0)
+        self.deer_alpha_factor.setDecimals(2)
+        self.deer_alpha_factor.setSingleStep(0.5)
+        self.deer_alpha_factor.setValue(1.0)
+        self.deer_alpha_factor.setToolTip(
+            'Multiply the auto-selected (GCV) α by this factor. 2–4× reproduces '
+            'the heavier hand-picked L-corner the DeerAnalysis ring-test labs '
+            'used for smooth distributions (JACS 2021). It buys smoothness with '
+            'bias: P(r) is pulled off the truth while the uncertainty band, which '
+            'sees noise only, gets NARROWER — its coverage at the peak falls from '
+            '~84% at 1× to ~8% at 2× and ~0% at 3×. Ignored when α is set '
+            'manually.')
+        self.deer_alpha_factor.setSuffix(' ×')
+        self.deer_alpha_factor.valueChanged.connect(self._live_update_tikhonov)
+        p.add_row('α strength', self.deer_alpha_factor)
+
+        self.live_check = gui_forms.live_update_checkbox()
+        p.add_widget(self.live_check)
+
+        self.deer_run_btn = QPushButton('Run Tikhonov')
+        self.deer_run_btn.setStyleSheet(BUTTON_STYLE)
+        self.deer_run_btn.clicked.connect(self.do_deer)
+        btn_exp = QPushButton('Export all…')
+        btn_exp.setStyleSheet(BUTTON_STYLE)
+        btn_exp.clicked.connect(self.save_deer_all)
+        p.add_button_row(self.deer_run_btn, btn_exp, width=ACTION_W)
+
+        self.deer_info = QLabel('')
+        self.deer_info.setStyleSheet(LABEL_STYLE)
+        self.deer_info.setWordWrap(True)
+        self.deer_info.setTextFormat(Qt.TextFormat.RichText)
+        self.deer_info.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.deer_info.setToolTip(self.MOMENTS_TOOLTIP)
+        p.add_widget(self.deer_info)
+        p.add_stretch()
+        return p
+
+    # ---- Tab 5: Mellin transform (analytic, model-free inversion) ----
+    def _build_mellin_tab(self):
+        p = FormPanel(field_width=FIELD_W, button_width=BTN_W)
+        p.add_title('Model-free analytic Mellin-transform inversion',
+                    help=_HELP_MELLIN)
+
+        self.mellin_delta = QDoubleSpinBox()
+        self.mellin_delta.setStyleSheet(DSPIN_STYLE)
+        self.mellin_delta.setRange(0.0, 1e9)
+        self.mellin_delta.setDecimals(5)
+        self.mellin_delta.setSingleStep(0.001)
+        self.mellin_delta.setValue(0.0)          # 0 ⇒ auto (F(δ)≈0.85, clipped 90–120 ns)
+        self.mellin_delta.setToolTip(
+            'Mellin split point δ (display time units), the lone regularizing '
+            'knob: on [0, δ] the form factor is integrated analytically (keeping '
+            'the parabolic echo top F≈F0+b·T²); [δ, end] is integrated '
+            'numerically. 0 = auto: F(δ)≈0.85, then clipped to 90–120 ns (the '
+            'floor keeps the echo-top anchor wide enough on sharp peaks; the cap '
+            'avoids over-smoothing long-r), and the floor is given up wherever the '
+            'echo top stops being parabolic before it — on a fast-decaying trace '
+            '(short or broad distances) it would otherwise put a known-wrong '
+            'parabola over part of the modulation and leave a systematic '
+            'early-time residual. Larger δ regularizes more (smoother, less '
+            'short-r noise); too large loses resolution.')
+        self.mellin_delta.valueChanged.connect(self._mellin_live)
+        self.mellin_delta_auto = QCheckBox('Auto')
+        self.mellin_delta_auto.setStyleSheet(CHECKBOX_STYLE)
+        self.mellin_delta_auto.setChecked(True)
+        self.mellin_delta_auto.setToolTip(
+            'Auto δ: where F falls to ≈0.85·F(0), clipped to 90–120 ns and held '
+            'inside the parabolic part of the echo top.')
+        self.mellin_delta_auto.stateChanged.connect(self._mellin_delta_toggle)
+        self.mellin_delta.setEnabled(False)
+        p.add_row('Split δ', self.mellin_delta, self.mellin_delta_auto,
+                  stretch=[2, 1])
+
+        self.mellin_taumax = QDoubleSpinBox()
+        self.mellin_taumax.setStyleSheet(DSPIN_STYLE)
+        self.mellin_taumax.setRange(2.0, 200.0)
+        self.mellin_taumax.setDecimals(1)
+        self.mellin_taumax.setSingleStep(1.0)
+        self.mellin_taumax.setValue(25.0)
+        self.mellin_taumax.setEnabled(False)
+        self.mellin_taumax.setToolTip(
+            'Upper limit of the Mellin variable τ (the transform runs over '
+            '[−τmax, τmax]). The high-τ cutoff is the regularizer: too small '
+            'blurs P(r); too large amplifies noise. 20–30 is typical.')
+        self.mellin_taumax.valueChanged.connect(self._mellin_live)
+        self.mellin_taumax_auto = QCheckBox('Auto')
+        self.mellin_taumax_auto.setStyleSheet(CHECKBOX_STYLE)
+        self.mellin_taumax_auto.setChecked(True)
+        self.mellin_taumax_auto.setToolTip(
+            'Choose the cutoff by the discrepancy principle: scan τmax and pick '
+            'the smallest one whose V-space fit residual reaches the noise floor '
+            '(σ_fit ≈ σ_noise). Smaller under-fits (residual ≫ noise), larger '
+            'over-fits (injects noise into P(r)). The chosen value and the '
+            'σ_fit/σ_noise ratio are reported below.')
+        self.mellin_taumax_auto.stateChanged.connect(self._mellin_taumax_toggle)
+        self.mellin_taumax_auto.stateChanged.connect(self._mellin_live)
+        p.add_row(gui_forms.sub('τ', 'max'), self.mellin_taumax, self.mellin_taumax_auto,
+                  stretch=[2, 1])
+
+        self.mellin_ntau = QSpinBox()
+        self.mellin_ntau.setStyleSheet(SPIN_STYLE)
+        self.mellin_ntau.setRange(101, 20001)
+        self.mellin_ntau.setSingleStep(200)
+        self.mellin_ntau.setValue(2001)
+        self.mellin_ntau.setToolTip(
+            'Number of τ samples across [−τmax, τmax]. Must resolve the τ-domain '
+            'oscillations (dτ ≲ 0.05); 2001 over ±25 (dτ = 0.025) is ample.')
+        self.mellin_ntau.valueChanged.connect(self._mellin_live)
+        p.add_row('τ points', self.mellin_ntau)
+
+        adv = p.add_advanced()
+
+        self.mellin_signed_chk = QCheckBox('Overlay signed P(r)')
+        self.mellin_signed_chk.setStyleSheet(CHECKBOX_STYLE)
+        self.mellin_signed_chk.setToolTip(
+            'Also draw the raw signed distribution (before clipping negatives), '
+            'whose short-r ripples are the propagated noise — the diagnostic the '
+            'Mellin method is prized for.')
+        self.mellin_signed_chk.stateChanged.connect(self._deer_rerender)
+        adv.add_widget(self.mellin_signed_chk)
+
+        self.mellin_signed_fit_chk = QCheckBox('Signed density in τₘₐₓ scan')
+        self.mellin_signed_fit_chk.setStyleSheet(CHECKBOX_STYLE)
+        self.mellin_signed_fit_chk.setToolTip(
+            'Score the τmax penalty against the honest SIGNED density (the masses '
+            'the Mellin inverse actually produced) instead of the clipped, '
+            'low-r-tapered one. It does NOT change the displayed fit, which is '
+            'built from the signed tapered density on its own (falling back to a '
+            'non-negative projection only if that would double-peak at t₀). With '
+            'τmax on Auto it moves the chosen '
+            'cutoff on about half of real traces, and the reported distance with '
+            'it; at a fixed τmax it changes nothing. Needs a re-run to take '
+            'effect.')
+        self.mellin_signed_fit_chk.setChecked(True)        # signed forward fit = default
+        self.mellin_signed_fit_chk.stateChanged.connect(self._mellin_live)
+        adv.add_widget(self.mellin_signed_fit_chk)
+
+        self.mellin_live = gui_forms.live_update_checkbox()
+        p.add_widget(self.mellin_live)
+
+        self.mellin_run_btn = QPushButton('Run Mellin')
+        self.mellin_run_btn.setStyleSheet(BUTTON_STYLE)
+        self.mellin_run_btn.clicked.connect(self.do_mellin)
+        btn_exp = QPushButton('Export all…')
+        btn_exp.setStyleSheet(BUTTON_STYLE)
+        btn_exp.clicked.connect(self.save_deer_all)
+        p.add_button_row(self.mellin_run_btn, btn_exp, width=ACTION_W)
+
+        self.mellin_info = QLabel('')
+        self.mellin_info.setStyleSheet(LABEL_STYLE)
+        self.mellin_info.setWordWrap(True)
+        self.mellin_info.setTextFormat(Qt.TextFormat.RichText)
+        self.mellin_info.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.mellin_info.setToolTip(self.MOMENTS_TOOLTIP)
+        p.add_widget(self.mellin_info)
+        p.add_stretch()
+        return p
+
+    # ---- Tab 6: Multi-Gaussian (parametric sum-of-Gaussians fit) ----
+    def _build_gauss_tab(self):
+        p = FormPanel(field_width=FIELD_W, button_width=BTN_W)
+        p.add_title('Fit P(r) as a sum of Gaussians', help=_HELP_MULTIGAUSS)
+
+        self.gauss_n = QSpinBox()
+        self.gauss_n.setStyleSheet(SPIN_STYLE)
+        self.gauss_n.setRange(1, 6)
+        self.gauss_n.setValue(2)
+        self.gauss_n.setEnabled(False)
+        self.gauss_n.setToolTip(
+            'Number of Gaussian components to fit. Enabled only when Auto is off; '
+            'with Auto on, N is chosen automatically (see below) and this box '
+            'shows the chosen value after the fit.')
+        self.gauss_n.valueChanged.connect(self._gauss_live)
+        self.gauss_n_auto = QCheckBox('Auto')
+        self.gauss_n_auto.setStyleSheet(CHECKBOX_STYLE)
+        self.gauss_n_auto.setChecked(True)
+        self.gauss_n_auto.setToolTip(
+            'Choose the number of components automatically: fit N = 1…N max and '
+            'keep the N that minimizes the criterion chosen in "Selection by" '
+            '(AICc by default), so extra Gaussians are not fit into noise. '
+            'Uncheck to force a fixed N.')
+        self.gauss_n_auto.stateChanged.connect(self._gauss_n_toggle)
+        self.gauss_n_auto.stateChanged.connect(self._gauss_live)
+        p.add_row('Components N', self.gauss_n, self.gauss_n_auto,
+                  stretch=[2, 1])
+
+        self.gauss_nmax = QSpinBox()
+        self.gauss_nmax.setStyleSheet(SPIN_STYLE)
+        self.gauss_nmax.setRange(1, 6)
+        self.gauss_nmax.setValue(4)
+        self.gauss_nmax.setToolTip(
+            'Largest component count tried during automatic model selection. If '
+            'the criterion is still improving at this value it has not found a '
+            'minimum, and N is set by this box rather than by the data — the '
+            'panel says so when that happens.')
+        self.gauss_nmax.valueChanged.connect(self._gauss_live)
+        p.add_row('N max', self.gauss_nmax,
+                  tooltip='Largest component count tried by the automatic '
+                          'model selection.')
+
+        self.gauss_ic = QComboBox()
+        self.gauss_ic.setStyleSheet(COMBO_STYLE)
+        self.gauss_ic.addItems(['AICc', 'AIC', 'BIC'])
+        self.gauss_ic.setToolTip(
+            'Information criterion for the automatic component count. AICc '
+            '(corrected Akaike, default) is the usual choice; BIC penalizes extra '
+            'components more strongly (favours fewer Gaussians).')
+        self.gauss_ic.currentIndexChanged.connect(self._gauss_live)
+        p.add_row('Selection by', self.gauss_ic)
+
+        self.gauss_method = QComboBox()
+        self.gauss_method.setStyleSheet(COMBO_STYLE)
+        self.gauss_method.addItems(['Least-squares', 'Monte-Carlo (Pake)'])
+        self.gauss_method.setToolTip(
+            'How the Gaussian parameters are found. <b>Least-squares</b> (default): '
+            'fast gradient fit in the time domain. <b>Monte-Carlo (Pake)</b> '
+            '(Dzuba, J. Magn. Reson. 269 (2016) 113; Matveeva et al., '
+            'Z. Phys. Chem. 231 (2017) 671): '
+            'a random multi-start search selected on the dipolar frequency (Pake) '
+            'spectrum — the random starts cannot be trapped in the spurious '
+            'floor-width-spike solution the gradient fit can fall into. '
+            '<b>Limits:</b> it does NOT match least-squares on clean data '
+            '(worse on both shape and component count), it is NOT '
+            'immune to ESEEM or background error, it fits the prepared form factor '
+            'so λ and the background are never re-fitted, and its band is the '
+            'spread of the optimizer over its own restarts (often exactly zero '
+            'wide). Prefer Least-squares unless you are probing search stability. '
+            'Slower (~seconds).')
+        self.gauss_method.currentIndexChanged.connect(self._gauss_method_toggle)
+        self.gauss_method.currentIndexChanged.connect(self._gauss_live)
+        p.add_row('Fit method', self.gauss_method)
+
+        adv = p.add_advanced()
+
+        self.gauss_comp_chk = QCheckBox('Overlay components')
+        self.gauss_comp_chk.setStyleSheet(CHECKBOX_STYLE)
+        self.gauss_comp_chk.setToolTip(
+            'Also draw each fitted Gaussian component separately (dashed), under '
+            'the total P(r).')
+        self.gauss_comp_chk.stateChanged.connect(self._deer_rerender)
+        adv.add_widget(self.gauss_comp_chk)
+
+        self.gauss_support_chk = QCheckBox('Rigorous CIs (95%)')
+        self.gauss_support_chk.setStyleSheet(CHECKBOX_STYLE)
+        self.gauss_support_chk.setToolTip(
+            'Compute per-component confidence intervals by the rigorous support-'
+            'plane / profile-likelihood method (Stein, Beth & Hustedt, Methods '
+            'Enzymol. 2015): each centre / σ is scanned and all other parameters '
+            're-fit, the interval taken where the residual sum of squares rises '
+            'above its minimum by the 95% F-test threshold. Accounts for parameter '
+            'correlations and gives ASYMMETRIC intervals — the magnitudes the fast '
+            'linearized ±σ (default, shown when this is off) can mis-state. Slower '
+            '(many re-fits: ~1–5 s).')
+        self.gauss_support_chk.stateChanged.connect(self._gauss_live)
+        adv.add_widget(self.gauss_support_chk)
+
+        self.gauss_live = gui_forms.live_update_checkbox()
+        p.add_widget(self.gauss_live)
+
+        self.gauss_run_btn = QPushButton('Run Gaussians')
+        self.gauss_run_btn.setStyleSheet(BUTTON_STYLE)
+        self.gauss_run_btn.clicked.connect(self.do_gauss)
+        btn_exp = QPushButton('Export all…')
+        btn_exp.setStyleSheet(BUTTON_STYLE)
+        btn_exp.clicked.connect(self.save_deer_all)
+        p.add_button_row(self.gauss_run_btn, btn_exp, width=ACTION_W)
+
+        self.gauss_info = QLabel('')
+        self.gauss_info.setStyleSheet(LABEL_STYLE)
+        self.gauss_info.setWordWrap(True)
+        self.gauss_info.setTextFormat(Qt.TextFormat.RichText)
+        self.gauss_info.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.gauss_info.setToolTip(self.MOMENTS_TOOLTIP)
+        p.add_widget(self.gauss_info)
+        p.add_stretch()
+        return p
+
+    def _gauss_n_toggle(self, *args):
+        self.gauss_n.setEnabled(not self.gauss_n_auto.isChecked())
+
+    def _gauss_method_toggle(self, *args):
+        """Monte-Carlo mode supplies its own ensemble confidence band, so the
+        support-plane CI option (a least-squares-only re-fit) does not apply."""
+        is_mc = self.gauss_method.currentIndex() == 1
+        self.gauss_support_chk.setEnabled(not is_mc)
+        if is_mc:
+            self.gauss_support_chk.setChecked(False)
+
+    def _gauss_live(self, *args):
+        if self._suppress_live:
+            return
+        if (self.gauss_live.isChecked() and self.real_xy[0] is not None
+                and self.deer_result is not None
+                and self.deer_result.get('engine', '') == 'gauss'):
+            self.do_gauss()
+
+    def _mellin_delta_toggle(self, *args):
+        self.mellin_delta.setEnabled(not self.mellin_delta_auto.isChecked())
+
+    def _mellin_taumax_toggle(self, *args):
+        self.mellin_taumax.setEnabled(not self.mellin_taumax_auto.isChecked())
+
+    def _mellin_live(self, *args):
+        if self._suppress_live:
+            return
+        if (self.mellin_live.isChecked() and self.real_xy[0] is not None
+                and self.deer_result is not None
+                and self.deer_result.get('engine', '').startswith('mellin')):
+            self.do_mellin()
+
+    # ----------------------------------------------------------- status
+    def set_status(self, text):
+        self.status.setText(text)
+        general.message(text)
+
+    def _set_loaded_file(self, name):
+        self.loaded_label.setText(f'File: {name}' if name else 'File: —')
+
+    # ----------------------------------------------------------- loading
+    def _remember_dir(self, path):
+        self.last_dir = os.path.dirname(path) or self.last_dir
+        _save_last_dir(self.last_dir)
+
+    def _open_dialog(self, multiple=False, **kw):
+        result = self.opener.open_file_dialog(multiprocessing=True,
+                                              directory=self.last_dir,
+                                              multiple=multiple, **kw)
+        if multiple:
+            paths = [p for p in (result or []) if p and p != 'None']
+            if paths:
+                self._remember_dir(paths[0])
+            return paths
+        if result and result != 'None':
+            self._remember_dir(result)
+        return result
+
+    def _save_dialog(self, **kw):
+        path = self.opener.create_file_dialog(multiprocessing=True,
+                                              directory=self.last_dir, **kw)
+        if path and path != 'None':
+            self._remember_dir(path)
+        return path
+
+    @staticmethod
+    def _csv_header_labels(file_path):
+        """Column labels from a CSV's '#'-comment header (last comment line before
+        the data, split on commas). Best-effort: returns [] on any trouble."""
+        labels = []
+        if str(file_path).endswith('.h5'):
+            try:
+                import h5py
+                with h5py.File(file_path, 'r') as fh:
+                    for s in str(fh.attrs.get('header', '')).splitlines():
+                        parts = [c.strip() for c in s.split(',')]
+                        if any(parts):
+                            labels = parts
+            except Exception:
+                return []
+            return labels if any(labels) else []
+
+        try:
+            with open(file_path, 'r', errors='ignore') as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    if s.startswith('#'):
+                        parts = [c.strip() for c in s.lstrip('#').split(',')]
+                        if any(parts):
+                            labels = parts
+                    else:
+                        break
+        except Exception:
+            return []
+        return labels if any(labels) else []
+
+    def _preset_deer_unit(self, label, x=None):
+        """If an axis label carries a time unit like 'Time (ns)', preset the
+        time-unit selector to match. With no unit in the label, fall back to the
+        trace's own magnitude. Returns an advisory for the caller's status line,
+        empty when the file stated its unit."""
+        u = ''
+        if label and label.endswith(')') and '(' in label:
+            u = label[label.rfind('(') + 1:-1].strip().lower()
+        tmap = {'ns': 'ns', 'us': 'µs', 'µs': 'µs', 'μs': 'µs', 'ms': 'ms'}
+        if u in tmap:
+            self.deer_tunit.setCurrentText(tmap[u])
+            return ''
+        return self._preset_unit_from_span(x)
+
+    def _preset_unit_from_span(self, x):
+        """Last resort for a file with no time unit: pick the unit that makes the
+        trace length a plausible DEER window. Reading a ns axis as µs scales every
+        distance by 10 (a 2.4 nm peak reads as 16-22 nm), so guessing beats keeping
+        whatever the selector happened to show — but the guess is always announced."""
+        cur = self.deer_tunit.currentText()
+        x = np.asarray(x, dtype=float) if x is not None else np.array([])
+        lo, hi = self.DEER_TSPAN_US
+        span = abs(float(x[-1] - x[0])) if x.size > 1 else 0.0
+        cand = [u for u, f in self.DEER_TUNITS.items() if lo <= span*f <= hi]
+        if span > 0 and cand and cur not in cand:
+            self.deer_tunit.setCurrentText(cand[0])
+            return (f' No time unit in the file — {cand[0]} assumed from the '
+                    f'{span:.4g} span; check the Time unit selector.')
+        return (f' No time unit in the file — read as {cur}; check the Time unit '
+                f'selector.')
+
+    def _csv_to_mapping(self, file_path):
+        """Read a CSV into a {channel label: (x, y)} mapping plus its header
+        labels. Raises ValueError on a structurally unusable file."""
+        _, data = self.opener.open_1d(file_path)
+        data = np.atleast_2d(data)
+        if data.shape[0] < 2:
+            raise ValueError('needs at least two columns (X and Y)')
+        if data.shape[0] > 6:
+            raise ValueError(f'looks like a 2D dataset ({data.shape[0]} columns)')
+        x = data[0]
+        labels = self._csv_header_labels(file_path)
+        mapping = {}
+        for i in range(1, data.shape[0]):
+            y = data[i]
+            mask = ~(np.isnan(x) | np.isnan(y))
+            name = labels[i] if (i < len(labels) and labels[i]) else f'Y{i}'
+            while name in mapping:
+                name += "'"
+            mapping[name] = (x[mask], y[mask])
+        return mapping, labels
+
+    def open_csv(self):
+        paths = self._open_dialog(multiple=True,
+                                  name_filters=['Data (*.csv *.h5)', 'All files (*)'])
+        if not paths:
+            return
+        items, failed, unit_label = [], [], None
+        for file_path in paths:
+            try:
+                mapping, labels = self._csv_to_mapping(file_path)
+            except Exception as e:
+                failed.append(f'{os.path.basename(file_path)} ({e})')
+                continue
+            if unit_label is None and labels and labels[0]:
+                unit_label = labels[0]
+            items.append((os.path.splitext(os.path.basename(file_path))[0], mapping))
+        # preset the time unit BEFORE registering (the auto distance range scales
+        # with _deer_tfactor(), which depends on the unit)
+        advice = ''
+        if items:
+            first_x = next(iter(items[0][1].values()))[0]
+            advice = self._preset_deer_unit(unit_label, first_x)
+        if items:
+            self._add_traces(items)
+        msg = f'Loaded {len(items)} trace(s)' if items else 'No traces loaded'
+        if failed:
+            msg += '. Skipped: ' + '; '.join(failed)
+        self.set_status(msg + '.' + advice)
+
+    def open_bruker(self):
+        """Load a Bruker dataset (BES3T .DSC/.DTA or ESP/WinEPR .par/.spc). A
+        complex trace registers as a real+imag I/Q pair; a time axis presets the
+        time-unit selector."""
+        nf = ['Bruker (*.DSC *.dsc *.DTA *.dta *.par *.spc *.PAR *.SPC)',
+              'BES3T (*.DSC *.dsc *.DTA *.dta)',
+              'ESP/WinEPR (*.par *.spc *.PAR *.SPC)', 'All files (*)']
+        file_path = self._open_dialog(name_filters=nf)
+        if not file_path or file_path == 'None':
+            return
+        try:
+            res = self.bruker.open(file_path)
+        except Exception as e:
+            self.set_status(f'Could not read Bruker file: {e}')
+            return
+        if res['ndim'] != 1:
+            self.set_status(f'{res["format"]} {res["ndim"]}D dataset '
+                            f'({res["data"].shape}) — load a 1D V(t) trace.')
+            return
+        x = np.asarray(res['x'], dtype=float)
+        mapping = {lbl: (x, np.asarray(y, dtype=float)) for lbl, y in res['channels']}
+        # Preset the time unit BEFORE registering: activating a trace runs the
+        # auto distance range, which scales with _deer_tfactor(). Setting the
+        # unit afterwards leaves the auto min/max one load behind.
+        u = (res['x_unit'] or '').strip().lower()
+        tmap = {'ns': 'ns', 'us': 'µs', 'µs': 'µs', 'μs': 'µs', 'ms': 'ms'}
+        if u in tmap:
+            self.deer_tunit.setCurrentText(tmap[u])
+            advice = ''
+        else:                                        # file carries no XUNI line
+            advice = self._preset_unit_from_span(x)
+        # leave I/Q pairing OFF by default even for complex data — the user opts in
+        # (many traces are already phased; auto-pairing surprised more than it helped)
+        self._add_traces([(os.path.splitext(os.path.basename(file_path))[0], mapping)])
+        self.set_status(f'Loaded {os.path.basename(file_path)} — {res["format"]}, '
+                        f'{len(x)} pts, '
+                        + ('complex (I/Q pair).' if res['complex'] else 'real.')
+                        + advice)
+
+    def load_from_buffer(self, silent=False):
+        if not os.path.isfile(BUFFER_PATH):
+            if not silent:
+                self.set_status('No plot buffer found. Right-click a plot in the '
+                                'main window → "Send to Data Treatment" first.')
+            return
+        try:
+            labels = []
+            buf_xname = ''
+            header_count = 0
+            with open(BUFFER_PATH, 'r') as fh:
+                for line in fh:
+                    if not line.startswith('#'):
+                        break
+                    header_count += 1
+                    if 'labels:' in line:
+                        labels = line.split('labels:', 1)[1].strip().split('|')
+                    elif 'xname:' in line:
+                        buf_xname = line.split('xname:', 1)[1].strip()
+            data = np.genfromtxt(BUFFER_PATH, delimiter=',', skip_header=header_count)
+            data = np.atleast_2d(data)
+            # one-shot mailbox: consume now so reopening the window does not
+            # reload this (stale) plot data
+            self._consume_buffer()
+            ncurves = data.shape[1] // 2
+            mapping = {}
+            for i in range(ncurves):
+                x = data[:, 2 * i]
+                y = data[:, 2 * i + 1]
+                mask = ~(np.isnan(x) | np.isnan(y))
+                label = labels[i] if i < len(labels) else f'curve {i}'
+                mapping[label] = (x[mask], y[mask])
+            if not mapping:
+                if not silent:
+                    self.set_status('Plot buffer is empty.')
+                return
+            advice = self._preset_deer_unit(buf_xname,
+                                            next(iter(mapping.values()))[0])
+            self._add_traces([('Loaded from plot', mapping)])
+            self.set_status(f'Loaded {len(mapping)} curve(s) from the current '
+                            f'plot.' + advice)
+        except Exception as e:
+            self._consume_buffer()
+            if not silent:
+                self.set_status(f'Could not read plot buffer: {e}')
+
+    def _consume_buffer(self):
+        try:
+            if os.path.isfile(BUFFER_PATH):
+                os.remove(BUFFER_PATH)
+        except OSError:
+            pass
+
+    def _unique_trace_name(self, name):
+        """A trace name not already in use (append (2), (3), … on collision)."""
+        name = name or 'trace'
+        if name not in self.traces:
+            return name
+        i = 2
+        while f'{name} ({i})' in self.traces:
+            i += 1
+        return f'{name} ({i})'
+
+    def _add_traces(self, items):
+        """Register one or more (name, channel-mapping) traces and make the last
+        one active. `items` is a list of (name, {label: (x, y)})."""
+        added = []
+        for name, mapping in items:
+            if not mapping:
+                continue
+            uname = self._unique_trace_name(name)
+            self.traces[uname] = dict(mapping)
+            added.append(uname)
+        if not added:
+            return
+        self.trace_combo.blockSignals(True)
+        self.trace_combo.addItems(added)
+        self.trace_combo.setCurrentIndex(self.trace_combo.count() - 1)
+        self.trace_combo.blockSignals(False)
+        self._activate_trace()                     # show the newly added trace
+
+    def _activate_trace(self, *args):
+        """Copy the selected trace's channels into self.datasets and rebuild the
+        channel selectors + downstream state (the per-load reset)."""
+        name = self.trace_combo.currentText()
+        mapping = self.traces.get(name, {})
+        # A fresh activation turns off live update so the raw trace is shown as-is.
+        self.live_check.setChecked(False)
+        for sb in (self.trim_start, self.trim_end):   # new trace: no trim carried over
+            sb.blockSignals(True)
+            sb.setValue(0)
+            sb.blockSignals(False)
+        self.datasets = dict(mapping)
+        keys = list(mapping)
+        sel_q = keys[1] if len(keys) > 1 else None
+        for combo, sel in ((self.i_combo, keys[0] if keys else None),
+                           (self.q_combo, sel_q)):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(keys)
+            if sel is not None:
+                combo.setCurrentIndex(keys.index(sel))
+            combo.blockSignals(False)
+        self.pair_check.blockSignals(True)
+        self.pair_check.setChecked(False)              # I/Q pairing is opt-in
+        self.pair_check.blockSignals(False)
+        self.on_source_changed()                  # populates self.real_xy
+        self._reset_bg_window()                    # default bg start (~2/3) + end (last pt)
+        self._show_input()                         # reposition cursors at the new window
+        if name:
+            self._set_loaded_file(f'{name}  ({self.trace_combo.currentIndex() + 1} '
+                                  f'of {self.trace_combo.count()})')
+
+    def _remove_trace(self):
+        """Drop the active trace; activate the next one, or clear if none remain."""
+        name = self.trace_combo.currentText()
+        if not name:
+            return
+        self.traces.pop(name, None)
+        idx = self.trace_combo.currentIndex()
+        self.trace_combo.blockSignals(True)
+        self.trace_combo.removeItem(idx)
+        self.trace_combo.blockSignals(False)
+        if self.trace_combo.count():
+            self.trace_combo.setCurrentIndex(min(idx, self.trace_combo.count() - 1))
+            self._activate_trace()
+            self.set_status(f'Removed trace "{name}".')
+        else:
+            self.clear_all()
+
+    # --------------------------------------------------------- channels
+    def on_source_changed(self, *args):
+        """I/Q selection or pair-mode change: drop the result, re-phase, re-show."""
+        self.deer_result = None
+        self.deer_band = None
+        self._batch_mode = False           # switching source leaves the batch overlay
+        self._clear_overlays()
+        self._apply_phase()
+        self._show_input()
+
+    def _trim_slice(self, n):
+        """Slice that drops the leading/trailing points set by the Trim controls
+        (clamped so at least 4 points survive)."""
+        ts = int(self.trim_start.value()) if hasattr(self, 'trim_start') else 0
+        te = int(self.trim_end.value()) if hasattr(self, 'trim_end') else 0
+        ts = max(0, min(ts, max(0, n - 4)))
+        te = max(0, min(te, max(0, n - 4 - ts)))
+        return slice(ts, n - te)
+
+    def _apply_phase(self):
+        """Rotate the selected I/Q to a real V(t) (or take I directly if not a
+        pair), after trimming the chosen leading/trailing points; store it in
+        self.real_xy as the DEER input."""
+        il = self.i_combo.currentText()
+        if il not in self.datasets:
+            self.real_xy = (None, None)
+            self.imag_y = None
+            return
+        x, idata = self.datasets[il]
+        x = np.asarray(x, dtype=float)
+        idata = np.asarray(idata, dtype=float)
+        n = len(x)
+        sl = self._trim_slice(n)
+        x = x[sl]
+        idata = idata[sl]
+        ql = self.q_combo.currentText()
+        self.imag_y = None
+        if (self.pair_check.isChecked() and ql in self.datasets and ql != il):
+            _, qdata = self.datasets[ql]
+            qdata = np.asarray(qdata, dtype=float)
+            if len(qdata) == n:
+                qdata = qdata[sl]
+                cor1 = float(self.phase_zero.value()) * np.pi / 180.0
+                out = self.fft.ph_correction(x, idata, qdata, cor1, 0.0, 0.0)
+                v = np.asarray(out[0], dtype=float)
+                self.imag_y = np.asarray(out[1], dtype=float)
+            else:
+                v = idata
+        else:
+            v = idata
+        self.real_xy = (x, v)
+
+    def _trim_changed(self, *args):
+        """Trim points changed: re-phase, re-estimate the background start for the
+        new span, and refresh the view (or refit if live)."""
+        self._apply_phase()
+        self._reset_bg_window()
+        if self.deer_result is not None and self.live_check.isChecked():
+            self.do_deer()
+        else:
+            self.deer_result = None
+            self.deer_band = None
+            self._show_input()
+
+    def _phase_changed(self, *args):
+        self._apply_phase()
+        if self.deer_result is not None and self.live_check.isChecked():
+            self.do_deer()
+        else:
+            self._show_input()
+
+    def auto_phase_zero(self):
+        """Fill φ₀ with the value that maximises the magnitude-weighted real part
+        of the time-domain I+iQ (see Fast_Fourier.auto_phase_zero)."""
+        il = self.i_combo.currentText()
+        ql = self.q_combo.currentText()
+        if il not in self.datasets or ql not in self.datasets or il == ql:
+            self.set_status('Select distinct I and Q channels for auto-phase.')
+            return
+        _, idata = self.datasets[il]
+        _, qdata = self.datasets[ql]
+        idata = np.asarray(idata, dtype=float)
+        qdata = np.asarray(qdata, dtype=float)
+        if idata.shape != qdata.shape or idata.size < 2:
+            self.set_status('I and Q must have equal length (≥ 2).')
+            return
+        sl = self._trim_slice(len(idata))         # phase the trimmed trace
+        idata, qdata = idata[sl], qdata[sl]
+        phi = self.fft.auto_phase_zero(idata + 1j * qdata)
+        self.phase_zero.setValue(phi)        # fires _phase_changed
+        self.set_status(f'Auto φ₀ = {phi:.2f}°.')
+
+    # --------------------------------------------------------- plotting
+    def _repaint(self, plot, legend, items, curves, xname, key_attr,
+                 left_label='', force=False):
+        """Repaint one plot: reuse curve items via setData, drop stale labels,
+        set the axis labels, and auto-range when the plotted content changes."""
+        wanted = set()
+        for spec in curves:
+            lbl, x, y, color, width = spec[:5]
+            style = spec[5] if len(spec) > 5 else None    # optional pen style (dashed fits)
+            wanted.add(lbl)
+            pen = (pg.mkPen(color, width=width, style=style) if style is not None
+                   else pg.mkPen(color, width=width))
+            xd, yd = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+            item = items.get(lbl)
+            if item is None:
+                items[lbl] = plot.plot(xd, yd, pen=pen, name=lbl)
+            else:
+                item.setData(xd, yd)
+                item.setPen(pen)
+        for lbl in [k for k in items if k not in wanted]:
+            plot.removeItem(items.pop(lbl))
+            try:
+                legend.removeItem(lbl)
+            except Exception:
+                pass
+        xlabel, xunit = _split_unit(xname)
+        plot.setLabel('bottom', xlabel, units=xunit)
+        try:
+            plot.getPlotItem().getAxis('bottom').enableAutoSIPrefix(_si_autoprefix(xunit))
+        except Exception:
+            pass
+        plot.setLabel('left', left_label)
+        key = (frozenset(wanted), xname, left_label)
+        # Only auto-range when there is something to frame; auto-ranging an empty
+        # plot (e.g. P(r) before a run is cleared/repainted on every parameter
+        # change) makes its limits jump around for no reason.
+        if wanted and (key != getattr(self, key_attr) or force):
+            try:
+                plot.autoRange()
+            except Exception:
+                pass
+        setattr(self, key_attr, key)
+
+    def _show_input(self):
+        """Show the current (phased) V(t) on the top plot and clear P(r). The
+        draggable background start/end cursors are shown here too, so the window
+        can be placed before running the inversion."""
+        x, v = self.real_xy
+        self._show_deer_band(False)
+        self._show_reliab_bands(False)
+        self._show_lcurve_marker(False)
+        if x is None or not len(x):
+            self._show_bg_cursor(False)
+            self._repaint(self.p_time, self.time_legend, self._time_items, [],
+                          f'Time ({self.deer_tunit.currentText()})', '_time_key')
+            self._repaint(self.p_pr, self.pr_legend, self._pr_items, [],
+                          'Distance (nm)', '_pr_key', left_label='P(r) (nm⁻¹)')
+            return
+        tunit = self.deer_tunit.currentText()
+        # I/Q pair: overlay the rotated imaginary channel so φ₀ can be tuned to
+        # null it; single real channel: just V(t).
+        if self.imag_y is not None and len(self.imag_y) == len(x):
+            curves = [('V (Re)', x, v, C_DATA, 1),
+                      ('Im', x, self.imag_y, C_IM, 1)]
+        else:
+            curves = [('V(t)', x, v, C_DATA, 1)]
+        self._repaint(self.p_time, self.time_legend, self._time_items, curves,
+                      f'Time ({tunit})', '_time_key', force=True)
+        self._repaint(self.p_pr, self.pr_legend, self._pr_items, [],
+                      'Distance (nm)', '_pr_key', left_label='P(r) (nm⁻¹)', force=True)
+        self._show_bg_cursor(True)      # background window draggable from the start
+
+    # --------------------------------------------------------- live update
+    def _live_update(self, *args):
+        """Live re-fit from a control SHARED by the engines (window, zero time,
+        distance grid). It must re-run whichever engine is on screen, not always
+        Tikhonov."""
+        if self._suppress_live:
+            return
+        if self.live_check.isChecked() and self.real_xy[0] is not None:
+            self._rerun_shown_engine()
+
+    def _live_update_tikhonov(self, *args):
+        """Live re-fit from a TIKHONOV-ONLY control (α and its auto/factor), which
+        must keep driving Tikhonov even while another engine's result is shown."""
+        if self._suppress_live:
+            return
+        if self.live_check.isChecked() and self.real_xy[0] is not None:
+            self.do_deer()
+
+    def _rerun_shown_engine(self):
+        eng = (self.deer_result or {}).get('engine', '')
+        if eng == 'gauss':
+            self.do_gauss()
+        elif eng.startswith('mellin'):
+            self.do_mellin()
+        else:
+            self.do_deer()
+
+    def _unit_changed(self, *args):
+        """Time-unit change: re-derive the auto distance range (it is computed from
+        the trace length in µs), then recompute if live (the kernel axis scales),
+        else just relabel the displayed input/result in the new unit."""
+        self._retune_auto_rrange()
+        if self.live_check.isChecked() and self.real_xy[0] is not None:
+            self.do_deer()
+        elif self.deer_result is not None:
+            self._render()
+        else:
+            self._show_input()
+
+    # --------------------------------------------------------- DEER params
+    def _deer_tfactor(self):
+        return self.DEER_TUNITS.get(self.deer_tunit.currentText(), 1.0)
+
+    def _deer_alpha_toggle(self, *args):
+        self.deer_alpha.setEnabled(not self.deer_alpha_auto.isChecked())
+
+    # Default background-start position as a fraction of the post-echo span. The
+    # SEQUENTIAL fit divides out a fitted decay, so its window must sit well into
+    # the decayed tail or it absorbs dipolar modulation: ~2/3 in (on the YopO set
+    # >=65% recovers the correct ~12% background; <=55% collapses it).
+    # The JOINT fit (capped-grid, lambda pinned to the V/B baseline) is robust to
+    # an EARLY window -- verified to recover k unchanged at 0.35 vs 0.66 even on
+    # strong backgrounds (B->0.6) -- so it uses a lower floor. A high floor there
+    # forces a late window that, on fast-dephasing (broad/multi-modal) P(r), lands
+    # in a regime where the joint k over-fits the residual decay tail and degrades
+    # P(r) (e.g. gauss_broad easy s0.0025: overlap 0.99 at 0.35 -> 0.94 at 0.66).
+    BG_START_FRAC = 0.66                  # sequential (and 'none'-engine fallback)
+    BG_START_FRAC_JOINT = 0.35            # joint / none: robust to an early window
+    BG_START_FRAC_MAX = 0.85
+
+    # info-panel tooltip for the moment descriptors (shared by all three engines)
+    MOMENTS_TOOLTIP = (
+        'mean r ± ME₁: the a priori rms error of the mean distance from random '
+        'noise alone (Nekrasov, Matveeva & Bowman, PCCP 2026). It is set by the '
+        'form-factor noise, the time step and the trace length — not by the '
+        'distribution — and needs no ground truth. It is a NOISE FLOOR, not a '
+        'bound: it contains no resolution or regularization-bias term, so the '
+        'real scatter can exceed it (measured up to 2.6× on a trace too short '
+        'to resolve the distance, where ME₁ is smallest). On the Multi-Gaussian '
+        'engine the gap is far wider, because the dominant error there is the '
+        'choice of N and ME₁ knows nothing about it: on real traces, moving '
+        '"N max" over 2/3/4 shifts the mean by 13–41× the printed bar. Read it '
+        'as the best the noise would allow, never as the uncertainty. mean, '
+        'width δr = rms width √(M₂−M₁²) and skew are all moments of the '
+        'non-negative part of P(r).')
+
+    def _bg_start_floor(self):
+        """Engine-aware background-start floor (see BG_START_FRAC notes)."""
+        eng = ('sequential', 'joint', 'none', 'general')[self.deer_engine.currentIndex()]
+        return self.BG_START_FRAC_JOINT if eng in ('joint', 'none') else self.BG_START_FRAC
+
+    def _auto_bg_start_value(self):
+        """Place the background start in the decayed tail: at the engine-aware floor
+        of the post-echo span by default (0.35 joint/none, 0.66 sequential), pushed
+        later if the modulation envelope is still significant past that point (never
+        earlier). Time in display units."""
+        x, v = self.real_xy
+        if x is None or len(x) < 16:
+            return None
+        x = np.asarray(x, dtype=float)
+        v = np.asarray(v, dtype=float)
+        floor = self._bg_start_floor()
+        i0 = int(np.argmax(np.abs(v)))            # echo centre
+        xs, vs = x[i0:], v[i0:]
+        n = len(xs)
+        if n < 16 or vs[0] == 0:
+            return float(xs[0] + floor * (x[-1] - xs[0]))
+        vn = vs / vs[0]
+        # rolling RMS of the oscillation (signal minus a heavy moving average)
+        win = max(5, n // 6)
+        k = np.ones(win) / win
+        osc = vn - np.convolve(vn, k, mode='same')
+        amp = np.sqrt(np.convolve(osc ** 2, k, mode='same'))
+        a0 = amp[:max(3, n // 10)].max() or float(amp.max()) or 1.0
+        sig = np.where(amp[:max(1, n - win)] > 0.15 * a0)[0]   # still-modulated
+        env_frac = (int(sig[-1]) / n) if len(sig) else 0.0
+        frac = min(max(env_frac, floor), self.BG_START_FRAC_MAX)
+        return float(xs[0] + frac * (xs[-1] - xs[0]))
+
+    def _auto_bg_start(self):
+        bg = self._auto_bg_start_value()
+        if bg is None:
+            self.set_status('Load a V(t) trace first.')
+            return
+        self.deer_bgstart.setValue(bg)
+        self.set_status(f'Auto background start = {bg:.4g} '
+                        f'{self.deer_tunit.currentText()}.')
+
+    # Longest distance the trace length supports: r_max ≈ 5·(t_max/2)^(1/3) nm
+    # (t_max in µs) — the DeerAnalysis/Jeschke rule of thumb for the reliable
+    # mean distance; mass beyond it is unconstrained by the data.
+    R_MAX_FACTOR = 5.0
+
+    def _auto_rmax_value(self):
+        """Trace-length-supported maximum distance (nm), or None if no data."""
+        x, _ = self.real_xy
+        if x is None or len(x) < 2:
+            return None
+        x = np.asarray(x, dtype=float)
+        t_us = abs(float(x[-1] - x[0]))*self._deer_tfactor()
+        if t_us <= 0:
+            return None
+        rmax = self.R_MAX_FACTOR*(t_us/2.0)**(1.0/3.0)
+        return float(np.clip(round(rmax, 1), self.deer_rmin.value() + 0.5, 50.0))
+
+    def _auto_rmin_value(self):
+        """Shortest distance the time step still resolves (nm), or None.
+
+        The fastest dipolar component (parallel, 2·nu_perp = 2·NU_DD/r^3 MHz)
+        must be Nyquist-sampled by the time increment Δt: 1/Δt ≥ 2·(2·NU_DD/r^3)
+        ⇒ r_min = (4·NU_DD·Δt)^⅓ (Δt in μs)."""
+        x, _ = self.real_xy
+        if x is None or len(x) < 2:
+            return None
+        x = np.asarray(x, dtype=float)
+        dt_us = abs(float(np.median(np.diff(x))))*self._deer_tfactor()
+        if dt_us <= 0:
+            return None
+        rmin = (4.0*deer_module.NU_DD*dt_us)**(1.0/3.0)
+        # round UP: rounding to nearest can land below the floor the engine clamps to
+        return float(np.clip(np.ceil(rmin*10.0)/10.0, 0.5,
+                             self.deer_rmax.value() - 0.5))
+
+    def _auto_rmax(self):
+        rmax = self._auto_rmax_value()
+        if rmax is None:
+            self.set_status('Load a V(t) trace first.')
+            return
+        self.deer_rmax.setValue(rmax)
+        self.set_status(f'Auto distance max = {rmax:.1f} nm '
+                        f'(trace-supported, 5·(t/2)^⅓).')
+
+    def _retune_auto_rrange(self):
+        """Refresh the distance window after a time-unit change, but only while it
+        still holds the auto-derived values — both bounds scale with the trace
+        length in µs, so a stale window reads a 2.4 nm peak as 18 nm."""
+        prev = getattr(self, '_rrange_auto', None)
+        if prev is None or self.real_xy[0] is None:
+            return
+        if (abs(self.deer_rmin.value() - prev[0]) > 1e-9
+                or abs(self.deer_rmax.value() - prev[1]) > 1e-9):
+            return                                 # user-edited: leave it alone
+        rmax, rmin = self._auto_rmax_value(), self._auto_rmin_value()
+        if rmax is None or rmin is None:
+            return
+        rmin = min(rmin, rmax - 0.5)
+        for sb in (self.deer_rmin, self.deer_rmax):
+            sb.blockSignals(True)
+        self.deer_rmax.setValue(rmax)
+        self.deer_rmin.setValue(rmin)
+        for sb in (self.deer_rmin, self.deer_rmax):
+            sb.blockSignals(False)
+        self._rrange_auto = (self.deer_rmin.value(), self.deer_rmax.value())
+
+    def _auto_rrange(self):
+        rmax = self._auto_rmax_value()
+        rmin = self._auto_rmin_value()
+        if rmax is None or rmin is None:
+            self.set_status('Load a V(t) trace first.')
+            return
+        for sb in (self.deer_rmin, self.deer_rmax):
+            sb.blockSignals(True)
+        self.deer_rmax.setValue(rmax)
+        self.deer_rmin.setValue(min(rmin, rmax - 0.5))
+        for sb in (self.deer_rmin, self.deer_rmax):
+            sb.blockSignals(False)
+        self._rrange_auto = (self.deer_rmin.value(), self.deer_rmax.value())
+        self.deer_rmax.valueChanged.emit(rmax)
+        self.set_status(f'Auto distance window = {self.deer_rmin.value():.1f}'
+                        f'–{rmax:.1f} nm (Δt-resolved min, trace-supported max).')
+
+    def _reset_bg_window(self):
+        """Set sensible defaults for the current (trimmed) trace: background start
+        ~2/3 in (auto), background end at the last point (so the end cursor shows),
+        and the distance max at the trace-length-supported limit."""
+        bg = self._auto_bg_start_value()
+        rmax = self._auto_rmax_value()
+        xr = self.real_xy[0]
+        sboxes = (self.deer_bgstart, self.deer_bgend, self.deer_rmin, self.deer_rmax)
+        for sb in sboxes:
+            sb.blockSignals(True)
+        if bg is not None:
+            self.deer_bgstart.setValue(bg)
+        if xr is not None and len(xr):
+            self.deer_bgend.setValue(float(np.asarray(xr, dtype=float)[-1]))
+        if rmax is not None:
+            self.deer_rmax.setValue(rmax)
+        rmin = self._auto_rmin_value()    # uses rmax just set above as the upper clamp
+        if rmin is not None and rmax is not None:
+            self.deer_rmin.setValue(min(rmin, rmax - 0.5))
+        for sb in sboxes:
+            sb.blockSignals(False)
+        self._rrange_auto = (self.deer_rmin.value(), self.deer_rmax.value())
+
+    def _deer_t0_max(self):
+        x, v = self.real_xy
+        if x is None or not len(x):
+            self.set_status('Load a V(t) trace first.')
+            return
+        x = np.asarray(x, dtype=float)
+        v = np.asarray(v, dtype=float)
+        self.deer_t0.setValue(float(x[int(np.argmax(np.abs(v)))]))
+
+    def _deer_bgend_max(self):
+        x, _ = self.real_xy
+        if x is None or not len(x):
+            self.set_status('Load a V(t) trace first.')
+            return
+        self.deer_bgend.setValue(float(np.asarray(x, dtype=float)[-1]))
+
+    # --------------------------------------------------------- inversion
+    def _start_inversion(self, compute, status, btn):
+        """Run `compute` on the worker thread, marking `btn` busy; the result is
+        applied in `_deer_finished`. Shared by the three engine wrappers."""
+        self._batch_mode = False           # a single fit replaces the batch overlay
+        self._deer_busy = True
+        self._deer_pending = False
+        btn.setEnabled(False)
+        btn.setStyleSheet(BUTTON_BUSY_STYLE)
+        self.set_status(status)
+        self._deer_worker = _DeerWorker(compute)
+        self._deer_worker.done.connect(self._deer_finished)
+        self._deer_worker.start()
+
+    def do_deer(self):
+        """Background-correct V(t) and invert to P(r) (Tikhonov + NNLS).
+
+        The fit (zero-time + joint background + inversion) is run on a worker
+        thread so the window stays responsive; results are applied back on the
+        main thread in `_deer_finished`.
+        """
+        if self._deer_busy:
+            # a fit is already running; remember to refit once it returns so the
+            # latest parameters / cursor positions are not lost. The tag records
+            # WHICH engine asked, so the drain does not silently switch engines.
+            self._deer_pending = 'tikhonov'
+            return
+        compute, status = self._tikhonov_compute()
+        if compute is None:
+            self.set_status(status)
+            return
+        self._start_inversion(compute, status, self.deer_run_btn)
+
+    def _tikhonov_compute(self):
+        """Snapshot the Tikhonov parameters from the widgets and return
+        (compute, status). `compute` is a Qt-free callable that runs the
+        zero-time + background + inversion and returns the `_deer_finished`
+        payload; returns (None, message) when the inputs are unusable. Shared by
+        `do_deer` and the batch `process_all`."""
+        x, v = self.real_xy
+        if x is None or len(x) < 8:
+            return None, 'Load a V(t) trace first (≥ 8 points).'
+        tf = self._deer_tfactor()
+        rmin, rmax = self.deer_rmin.value(), self.deer_rmax.value()
+        if rmax <= rmin:
+            return None, 'Distance max must exceed min.'
+        # snapshot everything the computation needs as plain values (the worker
+        # must not touch Qt widgets)
+        x = np.asarray(x, dtype=float)
+        v = np.asarray(v, dtype=float)
+        r = np.linspace(rmin, rmax, int(self.deer_rn.value()))
+        alpha = None if self.deer_alpha_auto.isChecked() else float(self.deer_alpha.value())
+        afac = float(self.deer_alpha_factor.value())
+        # a manual alpha needs no selection scan; pay the 36-point scan (~34x the
+        # single solve) only when the L-curve is actually being displayed
+        scan_lc = alpha is None or self.deer_show.currentText() == 'L-curve'
+        engine = ('sequential', 'joint', 'none', 'general')[self.deer_engine.currentIndex()]
+        dim = float(self.deer_dim.value())
+        fit_dim = self.deer_fitdim.isChecked()
+        echo_head = self.deer_echo_head.isChecked() and engine == 'joint'
+        validate = self.deer_validate_chk.isChecked()
+        fit_t0 = self.deer_fit_t0.isChecked()
+        bgs_disp = float(self.deer_bgstart.value())
+        bge_disp = float(self.deer_bgend.value())
+        t0_cur = float(self.deer_t0.value())
+        bgp = self._general_bg_params()
+
+        def compute():
+            t0_disp = t0_cur
+            if fit_t0:
+                t0u = deer_module.fit_zero_time(
+                    x * tf, v, bg_start=bgs_disp * tf,
+                    bg_end=(bge_disp * tf if bge_disp > bgs_disp else None),
+                    r=r, dim=dim, fit_dim=fit_dim, alpha=alpha,
+                    alpha_factor=afac, engine=engine)
+                t0_disp = t0u / tf
+            t_us = (x - t0_disp) * tf
+            bg_us = (bgs_disp - t0_disp) * tf
+            bg_end_us = ((bge_disp - t0_disp) * tf if bge_disp > bgs_disp else None)
+            if validate:
+                val = deer_module.deer_validate(
+                    t_us, v, r=r, bg_start=bg_us, bg_end=bg_end_us, dim=dim,
+                    fit_dim=fit_dim, alpha=alpha, alpha_factor=afac, engine=engine,
+                    bg_params=bgp, echo_head=echo_head)
+                res, band = val['base'], val
+            else:
+                res = deer_module.deer_invert(
+                    t_us, v, r=r, bg_start=bg_us, bg_end=bg_end_us, dim=dim,
+                    fit_dim=fit_dim, alpha=alpha, alpha_factor=afac, engine=engine,
+                    bg_params=bgp, scan_lcurve=scan_lc, echo_head=echo_head)
+                band = None
+            # display axis in acquisition time, over exactly the samples the engine kept
+            res['r_min_requested'] = float(np.min(r))
+            t_eng = np.asarray(res['t'], float)
+            # the reliability rule wants the largest positive t, not the span
+            res['t_max_us'] = float(np.max(t_eng)) if len(t_eng) else 0.0
+            res['pre'] = self._pre_zero(res, x, v, t_us, tf, t_eng)
+            res['t'] = t_eng + t0_disp * tf
+            if bg_end_us is not None:
+                res['background']['bg_end'] = bge_disp * tf
+            return {'t0_disp': t0_disp, 'res': res, 'band': band}
+
+        status = ('Fitting zero-time t0…' if fit_t0
+                  else ('Tikhonov validation: sweeping background start…'
+                        if validate else 'Running Tikhonov…'))
+        return compute, status
+
+    def do_mellin(self):
+        """Invert V(t) to P(r) by the analytic Mellin transform (model-free, no
+        Tikhonov). Reuses the Background tab's zero-time / window / dimension and
+        the shared distance grid; the Mellin tab supplies δ, τmax, τ points.
+        Runs on the same worker thread + finisher as `do_deer`."""
+        if self._deer_busy:
+            self._deer_pending = 'mellin'      # one queued slot, so N ticks -> 1 refit
+            return
+        compute, status = self._mellin_compute()
+        if compute is None:
+            self.set_status(status)
+            return
+        self._start_inversion(compute, status, self.mellin_run_btn)
+
+    def _mellin_compute(self):
+        """Snapshot the Mellin parameters and return (compute, status) — see
+        `_tikhonov_compute`. Shared by `do_mellin` and `process_all`."""
+        x, v = self.real_xy
+        if x is None or len(x) < 8:
+            return None, 'Load a V(t) trace first (≥ 8 points).'
+        tf = self._deer_tfactor()
+        rmin, rmax = self.deer_rmin.value(), self.deer_rmax.value()
+        if rmax <= rmin:
+            return None, 'Distance max must exceed min.'
+        # snapshot plain values for the worker (no Qt access inside compute)
+        x = np.asarray(x, dtype=float)
+        v = np.asarray(v, dtype=float)
+        r = np.linspace(rmin, rmax, int(self.deer_rn.value()))
+        dim = float(self.deer_dim.value())
+        fit_dim = self.deer_fitdim.isChecked()
+        fit_t0 = self.deer_fit_t0.isChecked()
+        bg_engine = ('sequential', 'joint', 'none', 'general')[self.deer_engine.currentIndex()]
+        bgs_disp = float(self.deer_bgstart.value())
+        bge_disp = float(self.deer_bgend.value())
+        t0_cur = float(self.deer_t0.value())
+        delta_disp = (0.0 if self.mellin_delta_auto.isChecked()
+                      else float(self.mellin_delta.value()))
+        tau_max = (None if self.mellin_taumax_auto.isChecked()
+                   else float(self.mellin_taumax.value()))
+        n_tau = int(self.mellin_ntau.value())
+        validate = self.deer_validate_chk.isChecked()
+        n_mc = 50 if self.deer_ci_chk.isChecked() else 0
+        signed_fit = self.mellin_signed_fit_chk.isChecked()
+        bgp = self._general_bg_params()
+
+        def compute():
+            t0_disp = t0_cur
+            if fit_t0:
+                t0u = deer_module.fit_zero_time(
+                    x * tf, v, bg_start=bgs_disp * tf,
+                    bg_end=(bge_disp * tf if bge_disp > bgs_disp else None),
+                    r=r, dim=dim, fit_dim=fit_dim)
+                t0_disp = t0u / tf
+            t_us = (x - t0_disp) * tf
+            bg_us = (bgs_disp - t0_disp) * tf
+            bg_end_us = ((bge_disp - t0_disp) * tf if bge_disp > bgs_disp else None)
+            delta_us = (delta_disp * tf) if delta_disp > 0 else None
+            mk = dict(delta=delta_us, tau_max=tau_max, n_tau=n_tau,
+                      bg_engine=bg_engine, bg_params=bgp,
+                      signed_fit=signed_fit)
+            if validate:
+                val = deer_module.deer_validate(
+                    t_us, v, r=r, bg_start=bg_us, bg_end=bg_end_us, dim=dim,
+                    fit_dim=fit_dim, engine='mellin', **mk)
+                res, band = val['base'], val
+            else:
+                res = deer_module.deer_invert_mellin(
+                    t_us, v, r=r, bg_start=bg_us, bg_end=bg_end_us, dim=dim,
+                    fit_dim=fit_dim, n_mc=n_mc, **mk)
+                band = None
+            # display axis in acquisition time, over exactly the samples the engine kept
+            res['r_min_requested'] = float(np.min(r))
+            t_eng = np.asarray(res['t'], float)
+            # the reliability rule wants the largest positive t, not the span
+            res['t_max_us'] = float(np.max(t_eng)) if len(t_eng) else 0.0
+            res['pre'] = self._pre_zero(res, x, v, t_us, tf, t_eng)
+            res['t'] = t_eng + t0_disp * tf
+            if bg_end_us is not None:
+                res['background']['bg_end'] = bge_disp * tf
+            return {'t0_disp': t0_disp, 'res': res, 'band': band}
+
+        status = ('Fitting zero-time t0…' if fit_t0
+                  else ('Mellin validation: sweeping background start…'
+                        if validate else ('Running Mellin transform '
+                        '(+ CI)…' if n_mc else 'Running Mellin transform…')))
+        return compute, status
+
+    def do_gauss(self):
+        """Invert V(t) to P(r) by a parametric sum-of-Gaussians fit (model
+        selection on N by AICc, or a fixed N). Reuses the Background tab's
+        zero-time / window / dimension and the shared distance grid; the
+        Multi-Gaussian tab supplies N / N max / criterion. Runs on the same
+        worker thread + finisher as `do_deer` / `do_mellin`."""
+        if self._deer_busy:
+            self._deer_pending = 'gauss'       # one queued slot, so N ticks -> 1 refit
+            return
+        compute, status = self._gauss_compute()
+        if compute is None:
+            self.set_status(status)
+            return
+        self._start_inversion(compute, status, self.gauss_run_btn)
+
+    def _gauss_compute(self):
+        """Snapshot the Multi-Gaussian parameters and return (compute, status) —
+        see `_tikhonov_compute`. Shared by `do_gauss` and `process_all`."""
+        x, v = self.real_xy
+        if x is None or len(x) < 8:
+            return None, 'Load a V(t) trace first (≥ 8 points).'
+        tf = self._deer_tfactor()
+        rmin, rmax = self.deer_rmin.value(), self.deer_rmax.value()
+        if rmax <= rmin:
+            return None, 'Distance max must exceed min.'
+        # snapshot plain values for the worker (no Qt access inside compute)
+        x = np.asarray(x, dtype=float)
+        v = np.asarray(v, dtype=float)
+        r = np.linspace(rmin, rmax, int(self.deer_rn.value()))
+        dim = float(self.deer_dim.value())
+        fit_dim = self.deer_fitdim.isChecked()
+        fit_t0 = self.deer_fit_t0.isChecked()
+        bg_engine = ('sequential', 'joint', 'none', 'general')[self.deer_engine.currentIndex()]
+        bgs_disp = float(self.deer_bgstart.value())
+        bge_disp = float(self.deer_bgend.value())
+        t0_cur = float(self.deer_t0.value())
+        n_gauss = (None if self.gauss_n_auto.isChecked()
+                   else int(self.gauss_n.value()))
+        max_gauss = int(self.gauss_nmax.value())
+        ic = self.gauss_ic.currentText().lower()
+        gmethod = 'mc' if self.gauss_method.currentIndex() == 1 else 'lsq'
+        # Monte-Carlo supplies its own ensemble band; covariance MC / support-plane
+        # CIs do not apply there.
+        n_mc = 0 if gmethod == 'mc' else (200 if self.deer_ci_chk.isChecked() else 0)
+        ci_mode = ('linear' if gmethod == 'mc'
+                   else ('support' if self.gauss_support_chk.isChecked() else 'linear'))
+        validate_flag = self.deer_validate_chk.isChecked()
+        bgp = self._general_bg_params()
+
+        def compute():
+            t0_disp = t0_cur
+            if fit_t0:
+                t0u = deer_module.fit_zero_time(
+                    x * tf, v, bg_start=bgs_disp * tf,
+                    bg_end=(bge_disp * tf if bge_disp > bgs_disp else None),
+                    r=r, dim=dim, fit_dim=fit_dim)
+                t0_disp = t0u / tf
+            t_us = (x - t0_disp) * tf
+            bg_us = (bgs_disp - t0_disp) * tf
+            bg_end_us = ((bge_disp - t0_disp) * tf if bge_disp > bgs_disp else None)
+            gk = dict(n_gauss=n_gauss, max_gauss=max_gauss, ic=ic,
+                      bg_engine=bg_engine, ci_mode=ci_mode, bg_params=bgp,
+                      method=gmethod)
+            if validate_flag and gmethod != 'mc':
+                # band comes from the background-start ensemble; no per-trial MC.
+                # mc is skipped on cost alone (~11 min/trace vs ~48 s), NOT because its
+                # own ensemble band suffices — that band covers 0.27-0.72 of a nominal 0.95
+                val = deer_module.deer_validate(
+                    t_us, v, r=r, bg_start=bg_us, bg_end=bg_end_us, dim=dim,
+                    fit_dim=fit_dim, engine='gauss', **gk)
+                res, band = val['base'], val
+            else:
+                res = deer_module.deer_invert_gauss(
+                    t_us, v, r=r, bg_start=bg_us, bg_end=bg_end_us, dim=dim,
+                    fit_dim=fit_dim, n_mc=n_mc, **gk)
+                band = None
+            # display axis in acquisition time, over exactly the samples the engine kept
+            res['r_min_requested'] = float(np.min(r))
+            t_eng = np.asarray(res['t'], float)
+            # the reliability rule wants the largest positive t, not the span
+            res['t_max_us'] = float(np.max(t_eng)) if len(t_eng) else 0.0
+            res['pre'] = self._pre_zero(res, x, v, t_us, tf, t_eng)
+            res['t'] = t_eng + t0_disp * tf
+            if bg_end_us is not None:
+                res['background']['bg_end'] = bge_disp * tf
+            return {'t0_disp': t0_disp, 'res': res, 'band': band}
+
+        # the sweep is skipped for mc, so the status must key on the same condition
+        status = ('Fitting zero-time t0…' if fit_t0
+                  else ('Multi-Gaussian validation: sweeping background '
+                        'start…' if (validate_flag and gmethod != 'mc')
+                        else ('Running Multi-Gaussian fit '
+                              '(Monte-Carlo, Pake domain)…' if gmethod == 'mc'
+                              else ('Running Multi-Gaussian fit '
+                                    '(support-plane CIs)…' if ci_mode == 'support'
+                                    else 'Running Multi-Gaussian fit…'))))
+        return compute, status
+
+    # ---------------------------------------------------------- batch: all traces
+    # distinct curve colours for the per-trace overlay (cycled if more traces)
+    BATCH_COLORS = [(211, 194, 78), (120, 170, 255), (120, 220, 150),
+                    (230, 140, 90), (200, 120, 220), (90, 200, 200),
+                    (240, 120, 150), (170, 200, 90)]
+
+    def _current_engine(self):
+        """Inversion engine for 'Process all', from its own engine picker
+        (independent of which tab is open)."""
+        return ('tikhonov', 'mellin', 'gauss')[self.batch_engine.currentIndex()]
+
+    def process_all(self):
+        """Run the current engine on every loaded trace and overlay the results
+        (P(r) on the bottom plot, form factors on top). The inversions run
+        synchronously here — the per-trace cost is small and a sequential loop
+        keeps the overlay/labelling simple — with a busy button + status."""
+        if self._deer_busy:
+            self.set_status('Busy — wait for the running inversion to finish.')
+            return
+        n = self.trace_combo.count()
+        if n == 0:
+            self.set_status('No traces loaded.')
+            return
+        engine = self._current_engine()
+        builder = {'tikhonov': self._tikhonov_compute,
+                   'mellin': self._mellin_compute,
+                   'gauss': self._gauss_compute}[engine]
+        names = [self.trace_combo.itemText(i) for i in range(n)]
+        self.process_all_btn.setEnabled(False)
+        self.process_all_btn.setStyleSheet(BUTTON_BUSY_STYLE)
+        results, failed = [], []
+        # the batch keeps payload['res'] only, so a per-trace validation sweep is
+        # paid for and then dropped -- and its base inversion is bit-identical to
+        # the plain one. Skip it here and say so, rather than bill the user for it.
+        validated = self.deer_validate_chk.isChecked()
+        if validated:
+            self.deer_validate_chk.blockSignals(True)
+            self.deer_validate_chk.setChecked(False)
+            self.deer_validate_chk.blockSignals(False)
+        try:
+            for i, name in enumerate(names):
+                self.trace_combo.setCurrentIndex(i)     # activate -> self.real_xy
+                compute, status = builder()
+                if compute is None:
+                    failed.append(name)
+                    continue
+                self.set_status(f'Process all ({engine}): {i + 1}/{n} — {name}…')
+                QApplication.processEvents()
+                try:
+                    payload = compute()
+                except Exception as e:
+                    failed.append(f'{name} ({e})')
+                    continue
+                results.append((name, payload['res']))
+        finally:
+            self.process_all_btn.setEnabled(True)
+            self.process_all_btn.setStyleSheet(BUTTON_STYLE)
+            if validated:
+                self.deer_validate_chk.blockSignals(True)
+                self.deer_validate_chk.setChecked(True)
+                self.deer_validate_chk.blockSignals(False)
+        if not results:
+            self.set_status('Process all: no trace produced a result.')
+            return
+        # keep the single-trace state consistent (last processed trace) so a later
+        # parameter tweak re-renders sensibly
+        self.batch_results = results
+        self.deer_result = results[-1][1]
+        self.deer_band = None
+        self._batch_mode = True            # keep the overlay across re-renders
+        self._render_batch(results)
+        # same alias test as the single-result panel: compare against what was asked
+        clamped = []
+        for nm, res in results:
+            ra, req = res.get('r_alias'), res.get('r_min_requested')
+            if ra and req is not None and float(req) < float(ra) - 1e-9:
+                clamped.append((nm, float(req), float(ra)))
+        self.batch_table = {'engine': engine, 'clamped': clamped, 'skipped_validate': validated,
+                            'rows': [(nm, self._trace_stats(res)) for nm, res in results]}
+        self._show_batch_summary()
+        self.batch_save_btn.setEnabled(True)
+        msg = f'Processed {len(results)}/{n} trace(s) — {engine} engine.'
+        if failed:
+            msg += ' Failed: ' + '; '.join(failed)
+        self.set_status(msg)
+
+    def _render_batch(self, results):
+        """Overlay every processed trace: P(r) on the bottom plot, and on top the
+        quantity chosen by the Show selector — each trace's data (thin solid) plus
+        its actual fit (dashed, same colour), or the fit residual. One colour per
+        trace. Hides the single-trace bands/cursors."""
+        tf = self._deer_tfactor()
+        tunit = self.deer_tunit.currentText()
+        self._show_deer_band(False)
+        self._show_reliab_bands(False)
+        self._show_lcurve_marker(False)
+        self._show_bg_cursor(False)
+        dash = Qt.PenStyle.DashLine
+        # The Show selector picks the TOP overlay in batch mode. Per-trace-only
+        # views (Residual ACF / L-curve) fall back to the residual / form factor.
+        view = self.deer_show.currentText()
+        residual = view in ('Residual', 'Residual ACF')
+        use_vt = view.startswith('V(t)') or view == 'Background fit'
+        top_label = ('residual' if residual else ('V(t)' if use_vt else 'form factor'))
+        # Mellin: optionally overlay each trace's raw signed P(r) (noise ripples),
+        # matching the single-result view's 'Overlay signed P(r)' option.
+        signed = self.mellin_signed_chk.isChecked()
+        pr_curves, top_curves = [], []
+        for i, (name, res) in enumerate(results):
+            col = self.BATCH_COLORS[i % len(self.BATCH_COLORS)]
+            r_arr = np.asarray(res['r'], float)
+            pr_curves.append((name, r_arr,
+                              np.asarray(res['P_density'], float), col, 2))
+            if (signed and res.get('engine', '').startswith('mellin')
+                    and res.get('P_signed_density') is not None):
+                pr_curves.append((f'{name} signed', r_arr,
+                                  np.asarray(res['P_signed_density'], float),
+                                  col, 1, dash))
+            t_disp = np.asarray(res['t'], float) / tf
+            bg = res['background']
+            lam = float(res['lambda'])
+            ff = self._fit_curve(res)                         # F_fit (form factor)
+            v_norm = np.asarray(bg['V_norm'], float)
+            v_fit = np.asarray(bg['B'], float) * ((1 - lam) + lam * ff)
+            pre = res.get('pre')                              # t < 0, per trace
+
+            def ext(y, key, pre=pre, t_disp=t_disp):
+                return self._cat_pre(pre, tf, t_disp, y, key)
+
+            if residual:
+                top_curves.append((name, *ext(v_norm - v_fit, 'resid'), col, 1))
+            elif use_vt:
+                level = ((1 - lam) * np.asarray(bg['B'], float)
+                         if view == 'Background fit' else v_fit)
+                lkey = 'level' if view == 'Background fit' else 'v_fit'
+                top_curves.append((name, *ext(v_norm, 'V_norm'), col, 1))
+                top_curves.append((f'{name} fit', *ext(level, lkey), col, 2, dash))
+            else:                                             # form factor + fit
+                top_curves.append((name, *ext(np.asarray(res['form_factor'], float),
+                                              'form_factor'), col, 1))
+                top_curves.append((f'{name} fit', *ext(ff, 'F_fit'), col, 2, dash))
+        self._show_t0_cursor(False)         # per-trace t0: one marker would mislead
+        self._show_batch_bands(results)
+        self._repaint(self.p_pr, self.pr_legend, self._pr_items, pr_curves,
+                      'Distance (nm)', '_pr_key', left_label='P(r) (nm⁻¹)', force=True)
+        self._repaint(self.p_time, self.time_legend, self._time_items, top_curves,
+                      f'Time ({tunit})', '_time_key', left_label=top_label, force=True)
+
+    def _clear_batch_bands(self):
+        """Remove all per-trace CI bands from the P(r) plot."""
+        for items in self._batch_band_items.values():
+            for it in items:
+                self.p_pr.removeItem(it)
+        self._batch_band_items = {}
+
+    def _show_batch_bands(self, results):
+        """Per-trace 95% uncertainty bands on the overlaid P(r), each a translucent
+        fill in the trace's colour. Gated by the 'Show 95% uncertainty band'
+        checkbox; only traces whose result carries P_lower/P_upper get a band."""
+        self._clear_batch_bands()
+        if not self.deer_ci_chk.isChecked():
+            return
+        missing = []
+        for i, (name, res) in enumerate(results):
+            lo, hi = res.get('P_lower'), res.get('P_upper')
+            if lo is None or hi is None:
+                missing.append(name)           # else the trace silently loses its band
+                continue
+            col = self.BATCH_COLORS[i % len(self.BATCH_COLORS)]
+            r = np.asarray(res['r'], float)
+            lo_item = pg.PlotDataItem(r, np.asarray(lo, float), pen=pg.mkPen(None))
+            hi_item = pg.PlotDataItem(r, np.asarray(hi, float), pen=pg.mkPen(None))
+            fill = pg.FillBetweenItem(lo_item, hi_item, brush=pg.mkBrush(*col, 50))
+            fill.setZValue(-5)                 # behind the P(r) curves
+            for it in (lo_item, hi_item, fill):
+                self.p_pr.addItem(it, ignoreBounds=True)   # never set the P(r) scale
+            self._batch_band_items[name] = (lo_item, hi_item, fill)
+        if missing:
+            self.set_status(self.status.text() + f' No band for {len(missing)} '
+                            f'trace(s): {", ".join(missing[:3])}'
+                            + ('…' if len(missing) > 3 else '') + '.')
+
+    def _trace_stats(self, res):
+        """Per-trace scalar summary (peak/mean/width/skew r, λ, k, dim, R², DW, r₁,
+        ME₁) reusing the same formulas as the single-result info panel."""
+        r = np.asarray(res['r'], float)
+        P = np.asarray(res['P_density'], float)
+        peak = float(r[int(np.argmax(P))]) if len(r) else float('nan')
+        dsc = deer_module.distribution_moments(r, P)
+        mean = float(dsc['mean'])                  # same density as width/skew
+        F = np.asarray(res['form_factor'], float)
+        Ff = self._fit_curve(res)
+        ss = float(np.sum((F - F.mean()) ** 2)) or 1.0
+        r2 = 1.0 - float(np.sum((F - Ff) ** 2)) / ss
+        wht = self._whiteness_of(res) or {}
+        try:
+            t_arr = np.asarray(res['t'], float)
+            eps_F = float(deer_module._tail_noise(t_arr, res['form_factor']))
+            dpos = np.diff(t_arr[t_arr > 0])
+            dt_ns = float(np.median(dpos)) * 1e3 if len(dpos) else 0.0
+            me1 = float(deer_module.moment_error_apriori(
+                eps_F, dt_ns, int(np.count_nonzero(t_arr > 0)), n=1))
+        except Exception:
+            me1 = float('nan')
+        return {'peak': peak, 'mean': mean, 'width': float(dsc['width']),
+                'skew': float(dsc['skew']),
+                'lambda': float(res.get('lambda', float('nan'))),
+                'k': res.get('k'), 'dim': res.get('dim'), 'r2': r2,
+                'dw': float(wht.get('durbin_watson', float('nan'))),
+                'acf1': float(wht.get('acf1', float('nan'))), 'me1': me1,
+                'n_gauss': res.get('n_gauss')}
+
+    def _summary_table_html(self, rows, engine):
+        """A compact HTML stats table from a list of (name, stats-dict) rows. Used
+        for both the single-result panel (one row) and the batch overlay."""
+        gauss = (engine == 'gauss')
+        hdr = (['', 'N', 'peak r', 'mean±ME₁', 'δr', 'λ', 'R²', 'DW'] if gauss
+               else ['', 'peak r', 'mean±ME₁', 'δr', 'λ', 'R²', 'DW'])
+        head = ''.join(f'<th style="padding:1px 7px;">{h}</th>' for h in hdr)
+        body = ''
+        for name, s in rows:
+            me = (f'{s["mean"]:.2f}±{s["me1"]:.3f}' if np.isfinite(s.get('me1', np.nan))
+                  else f'{s["mean"]:.2f}')
+            vals = [f'<b>{name}</b>']
+            if gauss:
+                vals.append(str(s['n_gauss']) if s.get('n_gauss') is not None else '—')
+            vals += [f'{s["peak"]:.2f}', me, f'{s["width"]:.2f}',
+                     f'{s["lambda"]:.3f}', f'{s["r2"]:.3f}', f'{s["dw"]:.2f}']
+            body += ('<tr>' + ''.join(f'<td style="padding:1px 7px;">{v}</td>'
+                                      for v in vals) + '</tr>')
+        return f'<table style="border-collapse:collapse;"><tr>{head}</tr>{body}</table>'
+
+    def _show_batch_summary(self):
+        """Render the per-trace summary table into the engine's info panel."""
+        tbl = self.batch_table
+        if not tbl:
+            return
+        clamped = tbl.get('clamped') or []
+        alias_line = ''
+        if clamped:
+            hi = max(c[2] for c in clamped)
+            alias_line = ('<span style="color: rgb(214, 39, 40);">r min raised on '
+                          f'{len(clamped)}/{len(tbl["rows"])} trace(s), up to '
+                          f'{hi:.2f} nm: sampling limit</span><br>')
+        val_line = ('<span style="color: rgb(150, 200, 255);">validation not run: '
+                    'the batch keeps one inversion per trace, and the sweep\'s own '
+                    'base result is identical to it — validate a single trace to '
+                    'see a band</span><br>' if tbl.get('skipped_validate') else '')
+        html = (f'<div style="line-height:150%;"><b style="color: rgb(211,194,78);">'
+                f'Process all — {len(tbl["rows"])} trace(s), {tbl["engine"]}</b><br>'
+                + self._summary_table_html(tbl['rows'], tbl['engine'])
+                + f'<br>{alias_line}{val_line}'
+                + '<i>r in nm; DW ≈ 2 ⇒ white residual.</i></div>')
+        panel = {'tikhonov': self.deer_info, 'mellin': self.mellin_info,
+                 'gauss': self.gauss_info}.get(tbl['engine'], self.deer_info)
+        panel.setText(html)
+
+    def save_batch(self):
+        """Save the per-trace summary table and all P(r) curves as two CSVs."""
+        tbl = self.batch_table
+        if not tbl or not self.batch_results:
+            self.set_status('No batch to save — run "Process all" first.')
+            return
+        path = self._save_dialog()
+        if not path or path == 'None':
+            return
+        base = path[:-4] if path.lower().endswith('.csv') else path
+
+        def f(x):
+            return (f'{x:.6g}' if x is not None and np.isfinite(x) else 'nan')
+
+        gauss = (tbl['engine'] == 'gauss')
+        cols = ['trace'] + (['N_gauss'] if gauss else []) + \
+               ['peak_r_nm', 'mean_r_nm', 'ME1_nm', 'width_nm', 'skew',
+                'lambda', 'k', 'dim', 'R2', 'DW', 'acf1']
+        lines = [','.join(cols)]
+        for name, s in tbl['rows']:
+            row = [str(name).replace(',', ';')]
+            if gauss:
+                row.append(str(s['n_gauss']) if s['n_gauss'] is not None else 'nan')
+            row += [f(s['peak']), f(s['mean']), f(s['me1']), f(s['width']),
+                    f(s['skew']), f(s['lambda']), f(s['k']), f(s['dim']),
+                    f(s['r2']), f(s['dw']), f(s['acf1'])]
+            lines.append(','.join(row))
+        summ = base + '_summary.csv'
+        # all P(r) curves side by side (r, P density per trace)
+        header2, cols2 = [], []
+        for name, res in self.batch_results:
+            header2 += [f'{name}:r_nm', f'{name}:P']
+            cols2.append(np.asarray(res['r'], float))
+            cols2.append(np.asarray(res['P_density'], float))
+        pr = base + '_Pr.csv'
+        try:
+            with open(summ, 'w') as fh:
+                fh.write(f'# DEER process-all summary, engine: {tbl["engine"]}\n')
+                fh.write('\n'.join(lines) + '\n')
+            maxlen = max((len(c) for c in cols2), default=0)
+            with open(pr, 'w') as fh:
+                fh.write(','.join(header2) + '\n')
+                for i in range(maxlen):
+                    fh.write(','.join((f'{c[i]:.6g}' if i < len(c) else '')
+                                      for c in cols2) + '\n')
+        except OSError as e:
+            self.set_status(f'Could not save batch: {e}')
+            return
+        self.set_status(f'Saved {os.path.basename(summ)} + {os.path.basename(pr)} '
+                        f'({len(tbl["rows"])} traces).')
+
+    def _deer_finished(self, payload):
+        """Apply a finished inversion (runs on the main thread via the signal).
+        Shared by the Tikhonov (`do_deer`), Mellin (`do_mellin`) and
+        Multi-Gaussian (`do_gauss`) engines."""
+        self._deer_busy = False
+        for btn in (self.deer_run_btn, self.mellin_run_btn, self.gauss_run_btn):
+            btn.setStyleSheet(BUTTON_STYLE)
+            btn.setEnabled(True)
+        if isinstance(payload, Exception):
+            self.set_status(f'Inversion failed: {payload}')
+            return
+        if self.real_xy[0] is None:       # data cleared while the fit ran; discard
+            self._deer_pending = False
+            return
+        res, band, t0_disp = payload['res'], payload['band'], payload['t0_disp']
+        self.deer_result = res
+        self.deer_band = band
+        tf = self._deer_tfactor()
+        is_mellin = res.get('engine', '').startswith('mellin')
+        is_gauss = res.get('engine', '') == 'gauss'
+        self.deer_t0.blockSignals(True)
+        self.deer_t0.setValue(t0_disp)
+        self.deer_t0.blockSignals(False)
+        if not is_mellin and not is_gauss and self.deer_alpha_auto.isChecked():
+            self.deer_alpha.blockSignals(True)
+            self.deer_alpha.setValue(float(res['alpha']))
+            self.deer_alpha.blockSignals(False)
+        # reflect the auto-fitted general-background coefficients into their boxes
+        gbgp = res.get('background', {}).get('params')
+        if (res.get('background', {}).get('model') == 'general' and gbgp
+                and self.gbg_auto.isChecked()):
+            for sp, key in ((self.gbg_a, 'a'), (self.gbg_b, 'b'),
+                            (self.gbg_c, 'c'), (self.gbg_d, 'd')):
+                sp.blockSignals(True)
+                sp.setValue(float(np.clip(gbgp[key], sp.minimum(), sp.maximum())))
+                sp.blockSignals(False)
+        # reflect the auto-chosen component count back into the (disabled) N box
+        if is_gauss and self.gauss_n_auto.isChecked():
+            self.gauss_n.blockSignals(True)
+            self.gauss_n.setValue(int(res.get('n_gauss', self.gauss_n.value())))
+            self.gauss_n.blockSignals(False)
+
+        F, Ff = res['form_factor'], self._fit_curve(res)
+        ss_tot = float(np.sum((F - F.mean()) ** 2)) or 1.0
+        r2 = 1 - float(np.sum((F - Ff) ** 2)) / ss_tot
+        # residual whiteness (Durbin-Watson + lag-1), engine-agnostic in V space
+        wht = self._whiteness_of(res)
+        if wht is not None and np.isfinite(wht['durbin_watson']):
+            wv = ('white' if wht['white'] else 'structured')
+            off = float(wht.get('offset', float('nan')))
+            # a pedestal survives the demeaning DW/r₁ are computed on, so flag it
+            off_txt = (f', offset = {off:+.2f}σ' if np.isfinite(off)
+                       and abs(off) > 0.25 else '')
+            wht_txt = (f'<br>resid: DW = {wht["durbin_watson"]:.2f}, '
+                       f'r₁ = {wht["acf1"]:+.2f}{off_txt} <i>({wv})</i>')
+            if not wht['white']:
+                wht_txt += ('<br><i>structured ≠ over-smoothed: on a trace whose '
+                            'tail is noise-dominated the fitted peak keeps ringing '
+                            'in the model where the data no longer does. Check the '
+                            'Residual view against the σ/√w band before changing α '
+                            'or the background.</i>')
+        else:
+            wht_txt = ''
+        # every scalar in the row comes from ONE density, the central trial
+        r_peak = float(res['r'][int(np.argmax(res['P_density']))])
+        r_mean = None                              # from distribution_moments below
+        if band is not None:
+            bgs = band['bg_starts'] / tf + t0_disp     # back to the acquisition axis
+            lo, hi = band['percentiles']
+            sp = band.get('trial_spread') or {}
+            degen = bool(sp.get('band_degenerate'))
+            band_txt = ('the sweep cannot probe this engine — it re-fits the '
+                        'background itself, so the background start never enters '
+                        'its objective; NO band is drawn' if degen
+                        else f'band = {lo:g}–{hi:g}%')
+            extra = (f'<br><b style="color: rgb(150, 200, 255);">validation</b><br>'
+                     f'{band["n_trials"]} trials, bg start {bgs[0]:.3g}–{bgs[-1]:.3g} '
+                     f'{self.deer_tunit.currentText()}<br>{band_txt}, '
+                     f'median peak {band["peak"]:.2f} nm, mean {band["r_mean"]:.2f} nm'
+                     + (f'<br>trial spread: mean {sp["r_mean_spread"]:.3f} nm, '
+                        f'λ {sp["lambda_spread"]:.3f}, '
+                        f'{sp["n_flagged"]}/{sp["n"]} flagged' if sp else ''))
+            med_tag = ' (central trial; curve and band from the sweep)'
+        else:
+            extra, med_tag = '', ''
+
+        # shape descriptors (rms width δr, skew) + a priori mean-distance error
+        # ME1 (Nekrasov/Matveeva/Bowman, PCCP 2026, DOI 10.1039/D5CP04144A): the
+        # noise-only error bar the acquisition itself allows on the mean distance,
+        # from the form-factor noise + step + length -- no ground truth needed.
+        dsc = deer_module.distribution_moments(res['r'], res['P_density'])
+        if r_mean is None:                         # same density as width/skew
+            r_mean = float(dsc['mean'])
+        try:
+            t_arr = np.asarray(res['t'], float)
+            eps_F = float(deer_module._tail_noise(t_arr, res['form_factor']))
+            dpos = np.diff(t_arr[t_arr > 0])
+            dt_ns = float(np.median(dpos)) * 1e3 if len(dpos) else 0.0
+            me1 = deer_module.moment_error_apriori(
+                eps_F, dt_ns, int(np.count_nonzero(t_arr > 0)), n=1)
+        except Exception:
+            me1 = float('nan')
+        me1_txt = f' ± {me1:.3f}' if np.isfinite(me1) else ''
+
+        if is_mellin:
+            tunit = self.deer_tunit.currentText()
+            delta_disp = float(res.get('delta', 0.0)) / tf
+            # reflect the auto-chosen δ / τmax back into the (disabled) spin boxes
+            self.mellin_delta.blockSignals(True)
+            self.mellin_delta.setValue(delta_disp)
+            self.mellin_delta.blockSignals(False)
+            if res.get('auto_taumax'):
+                self.mellin_taumax.blockSignals(True)
+                self.mellin_taumax.setValue(float(res.get('tau_max', 0)))
+                self.mellin_taumax.blockSignals(False)
+            # judged against the independent noise floor, not against σ_noise
+            def _pos(x):
+                return x is not None and np.isfinite(x) and x > 0
+
+            sf, sn, se = (res.get('sigma_fit'), res.get('sigma_noise'),
+                          res.get('noise_level'))
+            disc = ''
+            if _pos(sf) and _pos(se):
+                ratio = sf / se
+                disc += (f'<br>σ_fit/σ_e = {ratio:.2f} <i>('
+                         + ('matched' if ratio <= 1.5
+                            else 'residual above the noise floor') + ')</i>')
+            elif _pos(sf):
+                disc += (f'<br>σ_fit = {sf:.3g} (no independent noise floor on '
+                         f'this trace)')
+            if _pos(sn) and _pos(se) and sn / se > 1.5:
+                disc += (f'<br>tail residual {sn / se:.1f}× the noise floor — '
+                         f'check the background')
+            na = res.get('neg_area')
+            if na is not None and np.isfinite(na):
+                disc += f'<br>negative area = {na:.3f} <i>(τmax over-fit gauge)</i>'
+            if res.get('ci_unavailable') and self.deer_ci_chk.isChecked():
+                disc += (f'<br><span style="color: rgb(224, 130, 96);">⚠ '
+                         f'{res["ci_unavailable"]}</span>')
+            tag_auto = ' (auto)' if res.get('auto_taumax') else ''
+            reg = (f'split δ = {delta_disp:.4g} {tunit}<br>'
+                   f'τ max = {res.get("tau_max", 0):.0f}{tag_auto}{disc}')
+        elif is_gauss:
+            # the criterion is printed three words later from res['ic']; naming it
+            # here too was a hard-coded "AICc" that contradicted the combo
+            n_auto = ' (auto)' if self.gauss_n_auto.isChecked() else ''
+            support = res.get('ci_mode') == 'support'
+
+            # a parameter sitting ON its box bound is a bound, not a measurement:
+            # the local-quadratic bar is taken where the parameter cannot move, so
+            # it runs outside the feasible region. Say so instead of printing it.
+            _PINNED = {'sigma': (('sigma_at_floor', 'at width floor'),
+                                 ('sigma_at_ceiling', 'at width ceiling')),
+                       'center': (('center_at_bound', 'at range bound'),)}
+
+            def _ci(c, key, unit=''):
+                """Asymmetric -lo/+hi (support-plane) or symmetric ±err (linear);
+                a pinned parameter is reported as a bound instead."""
+                for flag, label in _PINNED.get(key, ()):
+                    if c.get(flag):
+                        return f'{unit} <i>({label})</i>'
+                lo = c.get(f'{key}_ci_lo'); hi = c.get(f'{key}_ci_hi')
+                v = c[key]
+                if support and lo is not None and hi is not None:
+                    return f'(−{v-lo:.3f}/+{hi-v:.3f}){unit}'
+                return f'± {c[key+"_err"]:.3f}{unit}'
+            # w is the share of the DRAWN curve (`mass_fraction`); `weight` is the
+            # analytic area fraction and over-states a component the r axis cuts
+            comp_lines = '<br>'.join(
+                f'&nbsp;&nbsp;{i+1}: r = {c["center"]:.3f} {_ci(c, "center")}, '
+                f'σ = {c["sigma"]:.3f} {_ci(c, "sigma", " nm")}, '
+                f'w = {c.get("mass_fraction", c["weight"]):.2f}'
+                for i, c in enumerate(res.get('components', [])))
+            ic_name = str(res.get('ic', 'aicc')).upper()
+            ic_val = res.get(res.get('ic', 'aicc'), float('nan'))
+            ci_tag = (f', 95% support-plane CI' if support
+                      else ', MC ensemble spread (per-component STD)'
+                      if res.get('ci_mode') == 'mc_ensemble'
+                      else ', 1σ linearized')
+            # note when parsimony pruning dropped a spurious (floor-width) component
+            prune_tag = (f' [pruned from {res.get("n_gauss_ic")}]'
+                         if res.get('pruned') else '')
+            # a component count that never reached the criterion was previously
+            # dropped with nothing said anywhere
+            failed = res.get('ic_failed') or []
+            fail_line = (
+                f'<br><span style="color: rgb(224, 130, 96);">⚠ N = '
+                f'{", ".join(str(n) for n, _ in failed)} could not be fit and '
+                f'were left out of the selection — the distance range is likely '
+                f'wider than the trace supports</span>' if failed else '')
+            # the criterion never turned over inside "N max", so N is the spin
+            # box's value rather than the data's — on real data this usually means
+            # a correlated residual, not more modes, so point at the regularized
+            # engine rather than tell the user to keep adding Gaussians
+            if res.get('ic_railed'):
+                fail_line += (
+                    f'<br><span style="color: rgb(224, 130, 96);">⚠ the '
+                    f'criterion still improved at N max — the data does not pin '
+                    f'the component count (N is the spin box, not the fit). This '
+                    f'is likely not a few discrete Gaussians; prefer the Tikhonov '
+                    f'or Mellin engine, which regularizes P(r) instead of counting '
+                    f'modes.</span>')
+            reg = (f'{res.get("n_gauss", "?")} Gaussian(s){n_auto}{prune_tag}, '
+                   f'{ic_name} = {ic_val:.1f}{ci_tag}{fail_line}<br>{comp_lines}')
+        else:
+            reg = f'α = {res["alpha"]:.4g}'
+        # background line: the general model reports its a/b/c/d coefficients
+        # (k / dim are not defined for it), the others their decay rate / dimension
+        bgp = res.get('background', {}).get('params')
+        if res.get('background', {}).get('model') == 'general' and bgp:
+            bg_line = (f'bg: a·exp[b(t+c·dᵗ)] &nbsp;(a={bgp["a"]:.3g}, b={bgp["b"]:.3g}, '
+                       f'c={bgp["c"]:.3g}, d={bgp["d"]:.3g})')
+        else:
+            bg_line = f'bg decay k = {res["k"]:.4g}, dim = {res["dim"]:.2f}'
+        # `flags` predict a wrong distance; `notes` false-alarm too often to say that
+        bgr = res.get('background', {})
+        # An engine that re-fits the background parks the preparation's reliability
+        # keys under 'prep' — they judge the starting estimate, not what is shown,
+        # so they are reported together under that label instead of as verdicts.
+        prep = bgr.get('prep') or {}
+        src = prep or bgr
+        flags = []
+        notes = []
+        prep_lines = []
+        bg_flags = prep_lines if prep else flags
+        bg_notes = prep_lines if prep else notes
+        if bgr.get('bg_start_early'):
+            per = float(bgr.get('bg_start_periods') or float('nan'))
+            # NOT demoted for the gauss lsq path, though the engine's own fit is
+            # window-independent there: with "Fit t0" on (the default) the window
+            # also feeds the zero-time fit, so moving it does change the answer --
+            # and measurably for the better. See ROADMAP 2026-08-07.
+            flags.append(f'background window opens at {per:.2f} dipolar periods '
+                         '— reported distance is biased short; start it later')
+        # these two judge the FINAL fit, so they stay top-level even on the gauss
+        # path, beside bg_start_early rather than inside the prep note
+        if bgr.get('form_factor_implausible'):
+            flags.append(f'|F| reaches {float(bgr.get("form_factor_absmax") or 0.0):.2f} '
+                         '— a normalized form factor cannot exceed 1: this is not a '
+                         'dipolar trace, or the background division blew up')
+        if bgr.get('lambda_collapsed'):
+            flags.append('no modulation depth — there is no dipolar signal here for '
+                         'a distance to be fitted to')
+        if src.get('conc_implausible'):
+            bg_flags.append(f'background implies '
+                            f'{float(src.get("conc_implied_uM") or float("nan")):.0f} µM '
+                            'spin concentration — the fit has absorbed the dipolar decay')
+        if src.get('lambda_clamped') or src.get('lambda_degenerate'):
+            bg_flags.append(f'λ clamped (raw {src.get("lambda_raw", float("nan")):.3g})')
+        if float(src.get('tail_abs_F') or 0.0) > 0.05:
+            bg_flags.append(f'tail not decayed (mean|F| = {src["tail_abs_F"]:.2f})')
+        if src.get('k_at_bound'):
+            bg_flags.append('k pinned at its search bracket edge (no information)')
+        if src.get('k_fit_failed'):
+            bg_flags.append('joint rate fit failed — k is the sequential tail fit, '
+                            'so the two routes agree by construction')
+        if (res.get('l_curve') or {}).get('at_bound'):
+            flags.append('α sits on the grid edge, not at an interior optimum')
+        # the flags above are the central trial's; this one is the whole sweep's
+        bsp = (band or {}).get('trial_spread') or {}
+        if bsp.get('disagree'):
+            flags.append(f'validation trials disagree (mean spans '
+                         f'{bsp["r_mean_spread"]:.2f} nm, '
+                         f'{bsp["n_flagged"]}/{bsp["n"]} flagged)')
+        if src.get('k_disagrees'):
+            bg_notes.append(('sequential tail fit sees no decay'
+                             if float(src.get('k_ref') or 0.0) <= 1e-4
+                             else f'k = {src["k_ratio"]:.3g}× the sequential tail fit')
+                            + ' — the two background routes differ, which is not on '
+                              'its own a sign the distance is wrong')
+        if src.get('bg_flat'):
+            bg_notes.append(f'background decays only '
+                            f'{100.0*float(src.get("bg_drop") or 0.0):.1f}% over the '
+                            'trace, so the two rate fits are not comparable')
+        # one labelled line, so a starting-background diagnostic is never read as a
+        # verdict on the λ and k this engine went on to fit
+        if prep_lines:
+            notes.append('the background this fit STARTED from (it re-fit λ and k '
+                         'afterwards, so these judge the starting estimate): '
+                         + '; '.join(prep_lines))
+        eh = res.get('echo_head') or {}
+        if eh.get('requested'):
+            if eh.get('applied'):
+                notes.append(f'echo-top head applied (δ = '
+                             f'{1e3*float(eh["delta"]):.0f} ns)')
+            elif eh.get('r_ratio'):
+                notes.append(f'echo-top head DECLINED by its guard '
+                             f'(r_mean/r_eff = {float(eh["r_ratio"]):.2f} > 1.25); '
+                             'noise inflates this ratio, so it also gates the head '
+                             'off at high noise')
+            else:
+                notes.append('echo-top head DECLINED: its curvature fit failed '
+                             '(too few points before t₀, or no usable curvature)')
+        if res.get('grid_truncated'):
+            notes.append(f'{100.0*float(res.get("mass_outside") or 0.0):.1f}% of the '
+                         'recovered mass lies beyond r max — the fit includes it, '
+                         'the plot does not; raise r max')
+        if flags:
+            bg_line += ('<br><span style="color: rgb(224, 130, 96);">⚠ '
+                        + '; '.join(flags) + '</span>')
+        if notes:
+            bg_line += ('<br><span style="color: rgb(150, 200, 255);">note: '
+                        + '; '.join(notes) + '</span>')
+        # headline scalars as a one-row table (same layout as 'Process all'), with
+        # the engine-specific detail (background, α / δ / components, skew) below.
+        row_stats = {'peak': r_peak, 'mean': r_mean, 'me1': me1,
+                     'width': float(dsc['width']), 'lambda': float(res['lambda']),
+                     'r2': r2, 'dw': (float(wht['durbin_watson'])
+                                      if wht is not None else float('nan')),
+                     'n_gauss': res.get('n_gauss')}
+        name = self.trace_combo.currentText() or 'P(r)'
+        verdict = ''
+        if wht is not None and np.isfinite(wht['durbin_watson']):
+            verdict = (' &nbsp;<i>(' + ('white' if wht['white'] else 'structured')
+                       + f', r₁={wht["acf1"]:+.2f})</i>')
+        # sampling-resolution limit: the engines now CLAMP to it, so compare against
+        # what was asked for, not against the grid that came back
+        ra = res.get('r_alias')
+        alias_line = ''
+        try:
+            req = res.get('r_min_requested')
+            if ra and req is not None and float(req) < float(ra) - 1e-9:
+                alias_line = (
+                    '<span style="color: rgb(214, 39, 40);">r min raised '
+                    f'{float(req):.2f} → {float(ra):.2f} nm: sampling limit</span><br>')
+        except Exception:
+            alias_line = ''
+        info_html = (
+            '<div style="line-height: 150%;">'
+            f'<b style="color: rgb(211, 194, 78);">P(r)</b>{med_tag}'
+            f' &nbsp;<i>({res.get("engine", "—")})</i><br>'
+            + self._summary_table_html([(name, row_stats)],
+                                       'gauss' if is_gauss else 'tikhonov')
+            + verdict
+            + '<div style="line-height: 160%; margin-top: 3px;">'
+            f'{bg_line}<br>{reg}<br>{alias_line}'
+            f'skew = {dsc["skew"]:+.2f}{extra}</div></div>')
+        self.deer_info.setText(info_html)
+        # a per-engine panel must never outlive its own result: give it the new
+        # text when it produced it, otherwise strike it as superseded
+        self._set_engine_panel(self.mellin_info, info_html, is_mellin)
+        self._set_engine_panel(self.gauss_info, info_html, is_gauss)
+        self._render()
+        if is_mellin:
+            self.set_status(f'Mellin: λ={res["lambda"]:.3f}, δ={delta_disp:.3g} '
+                            f'{self.deer_tunit.currentText()}, peak r={r_peak:.2f} nm, '
+                            f'R²={r2:.3f}.')
+        elif is_gauss:
+            tag = self._band_tag(band)
+            self.set_status(f'Multi-Gaussian: {res.get("n_gauss", "?")} comp., '
+                            f'λ={res["lambda"]:.3f}, peak r={r_peak:.2f} nm, '
+                            f'R²={r2:.3f}{tag}.')
+        else:
+            tag = self._band_tag(band)
+            self.set_status(f'Tikhonov: λ={res["lambda"]:.3f}, α={res["alpha"]:.3g}, '
+                            f'peak r={r_peak:.2f} nm, R²={r2:.3f}{tag}.')
+        # a parameter/cursor change arrived while we were busy -> refit once, in
+        # the engine that ASKED (the queued tag), not the one on screen: an
+        # explicit Run Tikhonov queued behind a gauss fit must return as Tikhonov,
+        # and an unconditional do_deer() here replaced a Multi-Gaussian result the
+        # user waited seconds for with a Tikhonov one
+        if self._deer_pending:
+            eng, self._deer_pending = self._deer_pending, False
+            {'gauss': self.do_gauss, 'mellin': self.do_mellin}.get(
+                eng, self.do_deer)()
+
+    STALE_NOTE = ('<div style="color: rgb(150, 150, 165);"><i>superseded by the '
+                  '{eng} result now shown — press Run to refit</i></div>')
+
+    def _set_engine_panel(self, panel, info_html, mine):
+        """Write `info_html` into an engine's info panel when that engine produced
+        the result; otherwise leave its last text but mark it superseded, so the
+        panel can never describe a curve that is no longer on screen."""
+        if mine:
+            panel.setText(info_html)
+            return
+        txt = panel.text()
+        if not txt or 'superseded by' in txt:
+            return
+        eng = (self.deer_result or {}).get('engine', '—')
+        panel.setText(self.STALE_NOTE.format(eng=eng)
+                      + f'<div style="color: rgb(120, 120, 130);">{txt}</div>')
+
+    def _deer_rerender(self, *args):
+        """Re-show the stored result under the current top-plot view. In batch
+        ('Process all') mode, re-render the per-trace overlay instead so the
+        Show selector / toggles never wipe it."""
+        if self._batch_mode and self.batch_results:
+            self._render_batch(self.batch_results)
+        elif self.deer_result is not None:
+            self._render()
+
+    def _render(self):
+        """Draw P(r) on the bottom plot and the chosen view on the top plot."""
+        self._clear_batch_bands()              # leaving the batch overlay
+        res = self.deer_result
+        if res is None:
+            return
+        tf = self._deer_tfactor()
+        tunit = self.deer_tunit.currentText()
+        t_disp = res['t'] / tf
+        bg = res['background']
+        pre = res.get('pre')
+
+        def ext(y, key):
+            return self._cat_pre(pre, tf, t_disp, y, key)
+
+        # ---- bottom plot: distance distribution ----
+        rr = np.asarray(res['r'], float)
+        t_max_us = res.get('t_max_us')
+        if t_max_us is None:                   # results from before this key existed
+            t_max_us = float(np.ptp(np.asarray(res['t'], float))) if len(res['t']) else 0.0
+        self._show_reliab_bands(self.deer_reliab_chk.isChecked(), t_max_us,
+                                rr[0] if len(rr) else None,
+                                rr[-1] if len(rr) else None)
+        if self.deer_band is not None:
+            b = self.deer_band
+            # a degenerate sweep (an engine that co-fits its own background) has
+            # no band to show; drawing one would read as certainty, not as
+            # "not measured" — see deer_validate's band_degenerate
+            self._show_deer_band(
+                not (b.get('trial_spread') or {}).get('band_degenerate'),
+                b['r'], b['P_lower'], b['P_upper'])
+            self._repaint(self.p_pr, self.pr_legend, self._pr_items,
+                          [('P(r) median', b['r'], b['P_density'], C_FIT, 2)],
+                          'Distance (nm)', '_pr_key', left_label='P(r) (nm⁻¹)',
+                          force=True)
+        else:
+            # covariance noise-propagation band (see deer.tikhonov_ci), if available;
+            # the Monte-Carlo engine's ensemble band always shows (it is the mode's
+            # native uncertainty estimate, not the optional covariance band).
+            if (res.get('P_lower') is not None
+                    and (self.deer_ci_chk.isChecked()
+                         or res.get('ci_mode') == 'mc_ensemble')):
+                self._show_deer_band(True, res['r'], res['P_lower'], res['P_upper'])
+            else:
+                self._show_deer_band(False)
+            pr_curves = [('P(r)', res['r'], res['P_density'], C_FIT, 2)]
+            # Mellin: optionally overlay the raw signed distribution (short-r
+            # ripples = propagated noise), the method's diagnostic output.
+            if (res.get('engine', '').startswith('mellin')
+                    and res.get('P_signed_density') is not None
+                    and self.mellin_signed_chk.isChecked()):
+                pr_curves.append(('P(r) signed', res['r'],
+                                  res['P_signed_density'], C_IM, 1))
+            # Multi-Gaussian: optionally overlay each fitted component. Built from
+            # `amplitude` over the on-grid total, which is what P_density is --
+            # scaling a unit Gaussian by `weight` (the ANALYTIC area fraction)
+            # under-shoots the drawn curve whenever a component is truncated by
+            # the r axis.
+            if (res.get('engine', '') == 'gauss'
+                    and self.gauss_comp_chk.isChecked()):
+                rr = np.asarray(res['r'], float)
+                tot = float(np.sum(res['P'])) or 1.0
+                for i, c in enumerate(res.get('components', [])):
+                    s = max(float(c['sigma']), 1e-6)
+                    comp = (float(c['amplitude'])
+                            * np.exp(-0.5*((rr - float(c['center']))/s)**2)/tot)
+                    pr_curves.append((f'comp {i+1}', rr, comp, C_IM, 1))
+            self._repaint(self.p_pr, self.pr_legend, self._pr_items, pr_curves,
+                          'Distance (nm)', '_pr_key', left_label='P(r) (nm⁻¹)',
+                          force=True)
+
+        # ---- top plot: chosen time-domain / L-curve view ----
+        view = self.deer_show.currentText()
+        ff = self._fit_curve(res)
+        self._show_t0_cursor(view not in ('Residual ACF', 'L-curve'))
+        if view == 'Form factor + fit':
+            self._repaint(self.p_time, self.time_legend, self._time_items,
+                          [('F(t)', *ext(res['form_factor'], 'form_factor'),
+                            C_DATA, 2),
+                           ('K·P fit', *ext(ff, 'F_fit'), C_FIT, 2)],
+                          f'Time ({tunit})', '_time_key', force=True)
+            self._show_bg_cursor(True)
+            self._show_lcurve_marker(False)
+        elif view == 'Background fit':
+            level = (1 - res['lambda']) * bg['B']
+            self._repaint(self.p_time, self.time_legend, self._time_items,
+                          [('V(t)', *ext(bg['V_norm'], 'V_norm'), C_DATA, 2),
+                           ('(1-λ)·B', *ext(level, 'level'), C_BG, 2)],
+                          f'Time ({tunit})', '_time_key', force=True)
+            self._show_bg_cursor(True)
+            self._show_lcurve_marker(False)
+        elif view == 'Residual':
+            # residual (data − fit) in V space, one noise band per curve
+            v_fit = bg['B'] * ((1 - res['lambda']) + res['lambda'] * ff)
+            resid = np.asarray(bg['V_norm'], float) - v_fit
+            wn = int(max(5, len(resid) // 50)) | 1
+            resid_sm = np.convolve(resid, np.ones(wn) / wn, mode='same')
+            # 'same' zero-pads, dragging the first/last wn points toward zero
+            edge = slice(wn, max(len(resid_sm) - wn, wn + 1))
+            curves = [('residual (V − fit)', t_disp, resid, C_DATA, 1),
+                      ('smoothed (coherent)', t_disp[edge], resid_sm[edge],
+                       C_FIT, 2)]
+            # The pre-t0 block is NOT a fit residual and is drawn apart from one.
+            # No engine fits below t0 (they crop those samples), and the model is
+            # exactly even in t, so the curve there is the positive fit read at |t|.
+            # A real echo is not exactly even about t0 — measured 1.4–2.4σ rms
+            # mirror mismatch on the YopO sample1 traces, at a t0 already sitting
+            # on the symmetry optimum — and that asymmetry lands here at several σ
+            # whatever the inversion does. Folded into one curve it reads as a bad
+            # fit, and it moves whenever the echo top moves, for reasons the fit
+            # cannot address.
+            if pre is not None:
+                curves.insert(0, ('pre-t₀ (mirrored fit, not fitted)',
+                                  np.asarray(pre['t'], float) / tf,
+                                  np.asarray(pre['resid'], float), C_IM, 1))
+            t_r = self._cat_pre(pre, tf, t_disp, resid, 'resid')[0]
+            # different quantities: fall back only if the first is absent, and say so
+            sig, sig_name = res.get('noise_level'), 'σ noise'
+            if sig is None or not np.isfinite(sig) or sig <= 0:
+                sig, sig_name = res.get('sigma_noise'), 'σ tail residual'
+            if sig is not None and np.isfinite(sig) and sig > 0:
+                ones = np.ones_like(t_r)
+                sig_sm = sig / np.sqrt(wn)
+                curves += [(f'+{sig_name}', t_r, sig * ones, C_BG, 1),
+                           (f'−{sig_name}', t_r, -sig * ones, C_BG, 1),
+                           (f'+{sig_name}/√w (smoothed)', t_r, sig_sm * ones,
+                            C_BAND, 1),
+                           (f'−{sig_name}/√w (smoothed)', t_r, -sig_sm * ones,
+                            C_BAND, 1)]
+            self._repaint(self.p_time, self.time_legend, self._time_items, curves,
+                          f'Time ({tunit})', '_time_key',
+                          left_label='residual', force=True)
+            self._show_bg_cursor(True)
+            self._show_lcurve_marker(False)
+        elif view == 'Residual ACF':
+            # ACF of the fit residual vs lag, with the ±1.96/√N white-noise band
+            self._show_bg_cursor(False)
+            self._show_lcurve_marker(False)
+            wht = self._whiteness_of(res)
+            if wht is None or not len(wht.get('acf', [])):
+                self.set_status('No residual ACF available for this result.')
+                return
+            lags = np.asarray(wht['lags'], float)
+            acf = np.asarray(wht['acf'], float)
+            ci = float(wht['ci95'])
+            ones = np.ones_like(lags)
+            self._repaint(self.p_time, self.time_legend, self._time_items,
+                          [('residual ACF', lags, acf, C_FIT, 2),
+                           ('+95% white noise', lags, ci * ones, C_BG, 1),
+                           ('−95% white noise', lags, -ci * ones, C_BG, 1)],
+                          'lag (points)', '_time_key',
+                          left_label='autocorrelation', force=True)
+        elif view == 'L-curve':
+            self._show_bg_cursor(False)
+            lc = res.get('l_curve')
+            if lc is None:
+                self.set_status('No L-curve for this result: it was computed with '
+                                'a manual α, which skips the scan. Re-run with the '
+                                'L-curve view selected, or tick Auto (GCV).')
+                self._show_lcurve_marker(False)
+                return
+            x, y = self._lcurve_xy(lc)
+            self._repaint(self.p_time, self.time_legend, self._time_items,
+                          [('L-curve', x, y, C_FIT, 2)],
+                          'log₁₀ residual ‖KP−F‖', '_time_key',
+                          left_label='log₁₀ roughness ‖LP‖', force=True)
+            idx = self._lcurve_index(lc, res['alpha'])
+            self._show_lcurve_marker(True, x[idx], y[idx])
+        else:  # 'V(t) + background + fit'
+            level = (1 - res['lambda']) * bg['B']
+            v_fit = bg['B'] * ((1 - res['lambda']) + res['lambda'] * ff)
+            self._repaint(self.p_time, self.time_legend, self._time_items,
+                          [('V(t)', *ext(bg['V_norm'], 'V_norm'), C_DATA, 2),
+                           ('background', *ext(level, 'level'), C_BG, 2),
+                           ('fit', *ext(v_fit, 'v_fit'), C_FIT, 2)],
+                          f'Time ({tunit})', '_time_key', force=True)
+            self._show_bg_cursor(True)
+            self._show_lcurve_marker(False)
+
+    def _fit_curve(self, res):
+        """The forward fit F_fit to display/score, as the engine built it. For the
+        Mellin engine that is K·(the tapered signed density) — the short-r taper is
+        always on here, so the `signed_fit` flag reaches only the τmax selector, not
+        this curve. Other engines return their own F_fit."""
+        return np.asarray(res['F_fit'], float)
+
+    def _pre_zero(self, res, x, v, t_us, tf, t_eng=None):
+        """Display-only extension of a result back through t < 0 (before t0).
+
+        Extends only below the engine's OWN first sample, not below t = 0: the
+        Tikhonov path's `pre_zero='even'` policy keeps the pre-t0 samples that pass
+        a mirror test (deer._crop_pre_zero), so those are fitted, not extrapolated.
+        `t_eng` is the engine's time array; without it the old drop-everything-
+        below-zero assumption is used.
+
+        The engines drop the remaining pre-t0 samples (the kernel evaluates |ω·t|,
+        so such a sample would be modelled as +|t| evolution and pile P(r) mass at
+        short r), so nothing they return is defined there. This
+        refits nothing: B(t) and F(t) = K(|t|)·P are both exactly EVEN in t, so
+        the fitted curves are read off the engine's own positive-time arrays at
+        |t| — evaluation, not extrapolation. The data are put on the engine's
+        V(0)=1 scale by the least-squares ratio to its V_norm (the echo-top
+        normalization the background functions applied internally).
+
+        Returns None when the trace starts at or after the zero time.
+        """
+        t_us = np.asarray(t_us, float)
+        t_first = 0.0 if t_eng is None or not len(t_eng) else float(np.min(t_eng))
+        pre = t_us < t_first
+        if not pre.any():
+            return None
+        bg = res['background']
+        Vn = np.asarray(bg['V_norm'], float)
+        vpos = np.asarray(v, float)[~pre]
+        n = min(len(Vn), len(vpos))
+        den = float(np.dot(Vn[:n], Vn[:n]))
+        if n < 1 or den <= 0:
+            return None
+        scale = float(np.dot(vpos[:n], Vn[:n]))/den
+        if not np.isfinite(scale) or scale == 0:
+            return None
+        tp = np.abs(t_us[pre])
+        tpos = np.asarray(bg['t'], float)
+        lam = float(res['lambda'])
+        B = np.interp(tp, tpos, np.asarray(bg['B'], float))
+        F_fit = np.interp(tp, tpos, self._fit_curve(res))
+        V_norm = np.asarray(v, float)[pre]/scale
+        v_fit = B*((1 - lam) + lam*F_fit)
+        return {'t': np.asarray(x, float)[pre]*tf, 'V_norm': V_norm, 'B': B,
+                'level': (1 - lam)*B, 'F_fit': F_fit, 'v_fit': v_fit,
+                'form_factor': (V_norm/B - (1 - lam))/lam,
+                'resid': V_norm - v_fit}
+
+    @staticmethod
+    def _cat_pre(pre, tf, t, y, key):
+        """One curve carried back through t < 0, when the pre-t0 block exists."""
+        y = np.asarray(y, float)
+        if pre is None:
+            return t, y
+        return (np.concatenate((np.asarray(pre['t'], float)/tf, t)),
+                np.concatenate((np.asarray(pre[key], float), y)))
+
+    def _whiteness_of(self, res):
+        """Residual-whiteness diagnostic from the V-space residual over the valid
+        dipolar fit region (t>0, via bg['t']) — matching the engine's own pos-based
+        whiteness so the toggle-off number reproduces it. Engine-agnostic. Returns
+        the residual_whiteness dict."""
+        try:
+            bg = res['background']
+            Vn = np.asarray(bg['V_norm'], float)
+            B = np.asarray(bg['B'], float)
+            lam = float(res['lambda'])
+            resid = Vn - B * ((1 - lam) + lam * self._fit_curve(res))
+            tt = bg.get('t')
+            if tt is not None:
+                tt = np.asarray(tt, float)
+                if len(tt) == len(resid):
+                    resid = resid[tt > 0]            # dipolar region only (drop pre-t0)
+            if len(resid) < 4:
+                return None
+            return deer_module.residual_whiteness(resid)
+        except Exception:
+            return None
+
+    # --------------------------------------------------------- overlays
+    @staticmethod
+    def _lcurve_xy(lc):
+        x = np.log10(np.asarray(lc['rho'], float) + 1e-300)
+        y = np.log10(np.asarray(lc['eta'], float) + 1e-300)
+        return x, y
+
+    @staticmethod
+    def _lcurve_index(lc, alpha):
+        a = np.asarray(lc['alphas'], float)
+        return int(np.argmin(np.abs(np.log(a) - np.log(max(alpha, 1e-300)))))
+
+    def _show_lcurve_marker(self, visible, x=None, y=None):
+        if self._lcurve_marker is None:
+            self._lcurve_marker = pg.ScatterPlotItem(
+                size=14, symbol='o', pen=pg.mkPen((20, 20, 30), width=1.5),
+                brush=pg.mkBrush(*C_FIT))
+            self._lcurve_marker.setZValue(20)
+            # ignoreBounds: the marker sits at log-roughness coordinates; if it
+            # counted toward autoRange it would corrupt the y-axis of the time-
+            # domain views when they are re-shown before the marker is hidden.
+            self.p_time.addItem(self._lcurve_marker, ignoreBounds=True)
+        if not visible:
+            self._lcurve_marker.setVisible(False)
+            return
+        self._lcurve_marker.setData([x], [y])
+        self._lcurve_marker.setVisible(True)
+
+    @staticmethod
+    def _band_tag(band):
+        """Status-line tag for a validation run: 'sweep', not 'band', when the
+        sweep produced no usable band (see deer_validate's band_degenerate)."""
+        if not band:
+            return ''
+        kind = ('sweep, no band'
+                if (band.get('trial_spread') or {}).get('band_degenerate')
+                else 'band')
+        return f' ({band["n_trials"]}-trial {kind})'
+
+    def _show_deer_band(self, visible, x=None, lo=None, hi=None):
+        """Show/hide the P(r) uncertainty band (confidence interval or validation
+        band) on the bottom plot."""
+        if self._band_fill is None:
+            # faint gold edge lines so a narrow band is still visible, plus a
+            # translucent fill bright enough to read against the dark background
+            edge = pg.mkPen(211, 194, 78, 160, width=1)
+            self._band_lo = pg.PlotDataItem(pen=edge)
+            self._band_hi = pg.PlotDataItem(pen=edge)
+            self._band_fill = pg.FillBetweenItem(
+                self._band_lo, self._band_hi, brush=pg.mkBrush(211, 194, 78, 110))
+            self._band_fill.setZValue(-10)
+            # ignoreBounds: the covariance band diverges as alpha -> 0 (1e5 nm^-1
+            # at the spinbox minimum), and autoRange would then squash P(r) flat
+            for it in (self._band_lo, self._band_hi, self._band_fill):
+                self.p_pr.addItem(it, ignoreBounds=True)
+        if not visible:
+            for it in (self._band_lo, self._band_hi, self._band_fill):
+                it.setVisible(False)
+            return
+        self._band_lo.setData(np.asarray(x, float), np.asarray(lo, float))
+        self._band_hi.setData(np.asarray(x, float), np.asarray(hi, float))
+        for it in (self._band_lo, self._band_hi, self._band_fill):
+            it.setVisible(True)
+
+    # DeerAnalysis distance-reliability factors (r in nm, t_max in µs): the shape
+    # of P(r) is reliable to 3·(t_max/2)^⅓ and the MEAN to 5·(t_max/2)^⅓ (the
+    # 4·(t_max/2)^⅓ width-only tier is folded into the yellow band). The 5·factor
+    # matches R_MAX_FACTOR used for the auto distance-max.
+    # The yellow band is optimistic near its top: measured on a narrow 5.0 nm
+    # distribution over 20 draws, the mean is good to ±0.07 nm at 83 % of the limit
+    # but biased short by 0.15-0.29 nm at 93 %, and the width is not recoverable
+    # anywhere in the band. Kept at the published factors because they are the
+    # shared convention; the tooltip carries the caveat.
+    RELIAB_FACTORS = (3.0, 5.0)
+
+    def _show_reliab_bands(self, visible, t_max_us=None, r_lo=None, r_hi=None):
+        """Shade the P(r) distance axis green/yellow/red by the DeerAnalysis
+        reliability ranges set by the dipolar evolution time t_max."""
+        if self._reliab_regions is None:
+            self._reliab_regions = []
+            # translucent, behind data and the uncertainty band (z below -10).
+            # Per-zone RGBA: yellow needs a higher alpha / punchier gold than
+            # green and red to read at all against the near-black background.
+            for rgba in ((60, 200, 90, 45), (240, 190, 30, 75), (230, 70, 70, 55)):
+                reg = pg.LinearRegionItem(values=(0.0, 0.0), movable=False,
+                                          brush=pg.mkBrush(*rgba),
+                                          pen=pg.mkPen(None))
+                reg.setZValue(-20)
+                self.p_pr.addItem(reg)
+                self._reliab_regions.append(reg)
+        if not visible or not t_max_us or t_max_us <= 0:
+            for reg in self._reliab_regions:
+                reg.setVisible(False)
+            return
+        f = (t_max_us / 2.0) ** (1.0 / 3.0)
+        g_hi, y_hi = (k * f for k in self.RELIAB_FACTORS)
+        r_lo = 0.0 if r_lo is None else float(r_lo)
+        r_hi = max(r_lo, float(r_hi)) if r_hi is not None else y_hi * 1.5
+        zones = ((r_lo, g_hi), (g_hi, y_hi), (y_hi, r_hi))
+        for reg, (a, b) in zip(self._reliab_regions, zones):
+            a = min(max(a, r_lo), r_hi)
+            b = min(max(b, r_lo), r_hi)
+            if b - a > 1e-9:
+                reg.setRegion((a, b))
+                reg.setVisible(True)
+            else:
+                reg.setVisible(False)
+
+    def _on_lcurve_click(self, event):
+        """On the L-curve view, pick the α of the nearest L-curve point."""
+        if (self.deer_result is None
+                or self.deer_show.currentText() != 'L-curve'):
+            return
+        lc = self.deer_result.get('l_curve')
+        if lc is None:
+            return
+        vb = self.p_time.plotItem.vb
+        pt = vb.mapSceneToView(event.scenePos())
+        x, y = self._lcurve_xy(lc)
+        rx = (x.max() - x.min()) or 1.0
+        ry = (y.max() - y.min()) or 1.0
+        d = ((x - pt.x()) / rx) ** 2 + ((y - pt.y()) / ry) ** 2
+        idx = int(np.argmin(d))
+        alpha = float(lc['alphas'][idx])
+        self.deer_alpha_auto.blockSignals(True)
+        self.deer_alpha_auto.setChecked(False)
+        self.deer_alpha_auto.blockSignals(False)
+        self.deer_alpha.setEnabled(True)
+        self.deer_alpha.blockSignals(True)
+        self.deer_alpha.setValue(alpha)
+        self.deer_alpha.blockSignals(False)
+        self.do_deer()
+
+    def _show_bg_cursor(self, visible):
+        """Show/position (or hide) the draggable background-start cursor on the
+        top plot. The cursor lives in display time units and drives deer_bgstart."""
+        if self._bg_cursor is None:
+            self._bg_cursor = pg.InfiniteLine(
+                angle=90, movable=True,
+                pen=pg.mkPen((211, 194, 78), width=2, style=Qt.PenStyle.DashLine),
+                hoverPen=pg.mkPen((255, 230, 120), width=3),
+                label='bg start', labelOpts={'color': (211, 194, 78),
+                                             'position': 0.93})
+            # ignoreBounds: keep the cursor out of autoRange so a view switch
+            # refits to the data, not to the cursor's (time) position
+            self.p_time.addItem(self._bg_cursor, ignoreBounds=True)
+            self._bg_cursor.sigPositionChangeFinished.connect(self._on_bg_cursor)
+        if not visible:
+            self._bg_cursor.setVisible(False)
+            self._show_bg_cursor_end(False)
+            return
+        self._suppress_cursor = True
+        self._bg_cursor.setValue(float(self.deer_bgstart.value()))
+        self._bg_cursor.setVisible(True)
+        self._suppress_cursor = False
+        self._show_bg_cursor_end(True)
+
+    def _on_bg_cursor(self, *args):
+        # Update the spin box only; recompute is governed by Live update / Run
+        # DEER (don't re-invert on every drag).
+        if self._suppress_cursor or self._bg_cursor is None:
+            return
+        self.deer_bgstart.setValue(float(self._bg_cursor.value()))
+
+    def _show_bg_cursor_end(self, visible):
+        """Show/position (or hide) the draggable background-end cursor; only
+        appears when an end limit is active (deer_bgend > deer_bgstart)."""
+        if self._bg_cursor_end is None:
+            self._bg_cursor_end = pg.InfiniteLine(
+                angle=90, movable=True,
+                pen=pg.mkPen((120, 200, 255), width=2, style=Qt.PenStyle.DashLine),
+                hoverPen=pg.mkPen((180, 225, 255), width=3),
+                label='bg end', labelOpts={'color': (120, 200, 255),
+                                           'position': 0.86})
+            self.p_time.addItem(self._bg_cursor_end, ignoreBounds=True)
+            self._bg_cursor_end.sigPositionChangeFinished.connect(self._on_bg_cursor_end)
+        active = float(self.deer_bgend.value()) > float(self.deer_bgstart.value())
+        if not (visible and active):
+            self._bg_cursor_end.setVisible(False)
+            return
+        self._suppress_cursor = True
+        self._bg_cursor_end.setValue(float(self.deer_bgend.value()))
+        self._bg_cursor_end.setVisible(True)
+        self._suppress_cursor = False
+
+    def _show_t0_cursor(self, visible):
+        """Show/position (or hide) the zero-time marker on the top plot. Fixed,
+        not draggable: t0 comes from the spin box / the fit, and it is what
+        separates the inverted region (t >= t0) from the pre-t0 samples now drawn
+        to its left."""
+        if self._t0_cursor is None:
+            self._t0_cursor = pg.InfiniteLine(
+                angle=90, movable=False,
+                pen=pg.mkPen((150, 150, 165), width=1, style=Qt.PenStyle.DashLine),
+                label='t₀', labelOpts={'color': (150, 150, 165),
+                                       'position': 0.99})
+            self.p_time.addItem(self._t0_cursor, ignoreBounds=True)
+        if not visible:
+            self._t0_cursor.setVisible(False)
+            return
+        self._t0_cursor.setValue(float(self.deer_t0.value()))
+        self._t0_cursor.setVisible(True)
+
+    def _on_bg_cursor_end(self, *args):
+        # Update the spin box only; recompute is governed by Live update / Run
+        # DEER (don't re-invert on every drag).
+        if self._suppress_cursor or self._bg_cursor_end is None:
+            return
+        self.deer_bgend.setValue(float(self._bg_cursor_end.value()))
+
+    def _clear_overlays(self):
+        """Hide all overlays (background/zero-time cursors, L-curve marker, band)."""
+        if self._bg_cursor is not None:
+            self._bg_cursor.setVisible(False)
+        if self._bg_cursor_end is not None:
+            self._bg_cursor_end.setVisible(False)
+        if self._t0_cursor is not None:
+            self._t0_cursor.setVisible(False)
+        if self._lcurve_marker is not None:
+            self._lcurve_marker.setVisible(False)
+        if self._band_fill is not None:
+            for it in (self._band_lo, self._band_hi, self._band_fill):
+                it.setVisible(False)
+
+    # --------------------------------------------------------- save / clear
+    def save_deer_all(self):
+        """Write every DEER stage to a set of sibling CSVs derived from one
+        chosen path: <base>_distance / _formfactor / _background / _lcurve.csv."""
+        res = self.deer_result
+        if res is None:
+            self.set_status('Run an inversion first — nothing to export.')
+            return
+        file_path = self._save_dialog()
+        if not file_path or file_path == 'None':
+            return
+        base = file_path[:-4] if file_path.lower().endswith('.csv') else file_path
+        tunit = self.deer_tunit.currentText()
+        t_disp = res['t'] / self._deer_tfactor()
+        bg = res['background']
+        is_mellin = res.get('engine', '').startswith('mellin')
+        is_gauss = res.get('engine', '') == 'gauss'
+        if is_mellin:
+            reg = (f'delta = {res.get("delta", 0)/self._deer_tfactor():.6g} {tunit}, '
+                   f'tau_max = {res.get("tau_max", 0):.6g}')
+        elif is_gauss:
+            support = res.get('ci_mode') == 'support'
+
+            _PIN = {'sigma': (('sigma_at_floor', 'at width floor'),
+                              ('sigma_at_ceiling', 'at width ceiling')),
+                    'center': (('center_at_bound', 'at range bound'),)}
+
+            def _gci(c, key):
+                for flag, label in _PIN.get(key, ()):
+                    if c.get(flag):
+                        return f'{c[key]:.4g}({label})'
+                lo, hi = c.get(f'{key}_ci_lo'), c.get(f'{key}_ci_hi')
+                if support and lo is not None and hi is not None:
+                    return f'{c[key]:.4g}[{lo:.4g},{hi:.4g}]'
+                return f'{c[key]:.4g}+/-{c[key+"_err"]:.2g}'
+            comps = '; '.join(f'r{i+1}={_gci(c, "center")} sigma={_gci(c, "sigma")} '
+                              f'w={c.get("mass_fraction", c["weight"]):.3g}'
+                              for i, c in enumerate(res.get('components', [])))
+            ick = str(res.get('ic', 'aicc'))
+            # the mc ensemble is optimizer spread, not a linearized 1-sigma bar,
+            # and the solver has to be recorded or the file cannot say which
+            # estimator produced it (the lsq return has no 'method' key)
+            ci_tag = ('95% support-plane CI' if support
+                      else 'MC ensemble spread (per-component STD)'
+                      if res.get('ci_mode') == 'mc_ensemble'
+                      else '1sigma linearized')
+            reg = (f'N = {res.get("n_gauss", "?")}, {ick.upper()} = '
+                   f'{res.get(ick, float("nan")):.6g}, '
+                   f'solver = {res.get("method", "lsq")}, {ci_tag}, [{comps}]')
+        else:
+            reg = f'alpha = {res["alpha"]:.6g}'
+        bgp = res.get('background', {}).get('params')
+        if res.get('background', {}).get('model') == 'general' and bgp:
+            bg_terms = (f'background a*exp(b*(t+c*d^t)) (a={bgp["a"]:.6g}, b={bgp["b"]:.6g}, '
+                        f'c={bgp["c"]:.6g}, d={bgp["d"]:.6g})')
+        else:
+            bg_terms = f'k = {res["k"]:.6g}, dim = {res["dim"]:.6g}'
+        reg_line = f'lambda = {res["lambda"]:.6g}, {bg_terms}, ' + reg
+        hdr = ['DEER/PDS analysis ('
+               + ('analytic Mellin transform, doi 10.1039/C7CP04059H)' if is_mellin
+                  else 'sum-of-Gaussians fit)' if is_gauss
+                  else 'Tikhonov + NNLS)'),
+               reg_line,
+               f'r {res["r"][0]:.4g}-{res["r"][-1]:.4g} nm ({len(res["r"])} pts), '
+               f'time unit {tunit}, bg start {self.deer_bgstart.value():.6g} {tunit}'
+               + (f', bg end {res["background"]["bg_end"]/self._deer_tfactor():.6g} {tunit}'
+                  if res['background'].get('bg_end') is not None else ', bg end: trace end')]
+        written = []
+
+        def _save(suffix, cols, col_header):
+            fn = f'{base}_{suffix}.csv'
+            self.opener.save_data(fn, np.column_stack(cols),
+                                  header='\n'.join(hdr + [col_header]), mode='w')
+            written.append(os.path.basename(fn))
+
+        if self.deer_band is not None:
+            b = self.deer_band
+            lo, hi = b['percentiles']
+            _save('distance', [b['r'], b['P_density'], b['P_lower'], b['P_upper'],
+                               b['P_mean']],
+                  f'r (nm), P(r) median density, {lo:g}% band, {hi:g}% band, '
+                  f'mean ({b["n_trials"]} trials)')
+        elif res.get('P_lower') is not None:
+            # the mc band is the optimizer's restart spread, not a noise band
+            bandsrc = ('ensemble spread' if res.get('ci_mode') == 'mc_ensemble'
+                       else 'noise only')
+            _save('distance', [res['r'], res['P_density'], res['P_lower'],
+                               res['P_upper'], res['P_norm']],
+                  f'r (nm), P(r) density, 95% band lower ({bandsrc}), '
+                  f'95% band upper ({bandsrc}), P (masses)')
+        elif is_mellin and res.get('P_signed_density') is not None:
+            _save('distance', [res['r'], res['P_density'], res['P_signed_density']],
+                  'r (nm), P(r) density (clipped, normalized), P(r) signed density')
+        else:
+            _save('distance', [res['r'], res['P_density'], res['P_norm']],
+                  'r (nm), P(r) density, P (masses)')
+        _save('formfactor', [t_disp, res['form_factor'], res['F_fit'], res['residuals']],
+              f'time ({tunit}), F(t), K*P fit, residuals')
+        _save('background', [t_disp, bg['V_norm'], bg['B'], (1 - res['lambda']) * bg['B']],
+              f'time ({tunit}), V(t) norm, B(t), (1-lambda)*B(t)')
+        lc = res.get('l_curve')
+        if lc is not None:
+            _save('lcurve', [lc['alphas'], lc['rho'], lc['eta'], lc['curvature']],
+                  'alpha, residual norm, solution norm, curvature')
+        self.set_status('Exported DEER stages: ' + ', '.join(written))
+
+    def clear_all(self):
+        """Reset the window: forget all loaded data, result and selectors."""
+        self.datasets = {}
+        self.traces = {}
+        self.real_xy = (None, None)
+        self.imag_y = None
+        self.deer_result = None
+        self.deer_band = None
+        self.batch_results = None
+        self.batch_table = None
+        self._batch_mode = False
+        self._clear_batch_bands()
+        self.batch_save_btn.setEnabled(False)
+        self._deer_pending = False        # cancel any queued refit
+        self._clear_overlays()
+        for combo in (self.trace_combo, self.i_combo, self.q_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.blockSignals(False)
+        for plot, legend, items in ((self.p_time, self.time_legend, self._time_items),
+                                    (self.p_pr, self.pr_legend, self._pr_items)):
+            for lbl in list(items):
+                plot.removeItem(items.pop(lbl))
+                try:
+                    legend.removeItem(lbl)
+                except Exception:
+                    pass
+        self._time_key = self._pr_key = None
+        self.deer_info.setText('')
+        self.mellin_info.setText('')
+        self.gauss_info.setText('')
+        self._set_loaded_file(None)
+        self.set_status('Cleared. Load a V(t) trace to begin.')
+
+
+def main():
+    app = QApplication(sys.argv)
+    apply_app_style(app, app_id='Atomize.ITC.DeerAnalysis', desktop='deer')
+    window = MainWindow()
+    window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    window.destroyed.connect(app.quit)
+    window.window_size = WindowSize(window, 'analysis/deer_analysis/size')
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    main()

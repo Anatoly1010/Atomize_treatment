@@ -1,0 +1,2974 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+2D Data Treatment control-center window.
+
+Standalone QProcess launched from the "EPR Endstation Control" tab, the 2D
+sibling of data_treatment.py, for I/Q 2D datasets (echo decay / FID vs a
+parameter). It mirrors the phase_cor.py workflow:
+
+  * I/Q loading by name convention — open `name.csv` (I); `name_1.csv` (Q) is
+    loaded automatically. Each file is a matrix [trace, point] (rows = the
+    slow/indirect parameter, columns = the fast within-trace axis). An `.h5`
+    file holds both quadratures, and its axis datasets fill the axis fields.
+  * Axis metadata is set by hand (start / step / name / unit per axis) — there
+    is no .param sidecar.
+  * Independent, chainable operations:
+      - Phase correction: time-domain frequency shift in MHz and constant phase,
+        or spectral phase in deg, deg/MHz and deg/MHz² along X.
+      - FFT (selectable axis): complex FFT of I+iQ along the within-trace (X) or
+        the indirect (Y) axis, with optional apodization + zero fill; the
+        transformed axis becomes frequency.
+      - Filter (selectable axis): FFT → passband mask → inverse FFT along X, Y or
+        both axes, each with its own type and cutoffs; the axes stay unchanged.
+      - Shear: V′(t_dip, t) = V(t_dip + k·(t − t_ref), t) as an exact phase ramp on
+        the dipolar-axis spectrum, straightening a dipolar ridge tilted across the
+        echo (k = 1/2 for SIFTER), with a shear-scan or cross-correlation
+        estimator of k.
+
+The window embeds the same CrossSectionDock the main GUI uses (heatmap + X/Y
+cross-section sub-docks), fed in-process — no LivePlot IPC. Real and imaginary
+parts ride along as the two toggleable frames of a (2, nX, nY) array (the frame
+slider switches between them); a real-only dataset (Q ≡ 0) is a single frame.
+"Result → input" chains one operation into the next (e.g. phase → FFT).
+"""
+
+import ast
+import os
+import re
+import sys
+from atomize.main.window_size import WindowSize
+import numpy as np
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QFileSystemWatcher, QTimer
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QComboBox, QGridLayout, QVBoxLayout, QHBoxLayout, QTabWidget, QDoubleSpinBox,
+    QSpinBox, QLineEdit, QCheckBox, QFrame)
+
+import atomize.general_modules.general_functions as general
+import atomize.general_modules.csv_opener_saver as openfile
+import atomize.general_modules.bruker_opener as bruker
+import atomize.math_modules.signal_processing as sigproc
+import atomize.math_modules.least_square_fitting_modules as fitting
+import atomize.math_modules.fft as fft_module
+# Reuse the main-window 2D plot stack (heatmap + X/Y cross-sections) so the
+# embedded preview matches the main UI; fed in-process, no LivePlot IPC.
+from pyqtgraph.dockarea import DockArea
+from atomize.main.widgets import CrossSectionDock
+# Shared look and form primitives — one source of truth for every tool.
+from atomize.general_modules.gui_style import (BG, FG, ACCENT, BUTTON_STYLE,
+                                               LABEL_STYLE, CHECKBOX_STYLE,
+                                               DSPIN_STYLE, SPIN_STYLE,
+                                               COMBO_STYLE, LINEEDIT_STYLE,
+                                               ANALYSIS_TAB_STYLE)
+import atomize.general_modules.gui_forms as gf
+
+# Parameter-header viewer shared with the 1D tool (separate non-modal window).
+from atomize.treatment.header_view import (HeaderWindow, read_header,
+                                                params_to_lines, header_frequency_shift)
+
+# solid-yellow "busy" variant for the Run-fit button while a fit is in progress
+# (explicit colour so it stays yellow even while the button is disabled).
+BUTTON_BUSY_STYLE = ("QPushButton {border-radius: 4px; background-color: rgb(211, 194, 78); "
+    "border-style: inset; color: rgb(42, 42, 64); font-weight: bold; padding: 4px; } "
+    "QPushButton:disabled {background-color: rgb(211, 194, 78); color: rgb(42, 42, 64); }")
+
+def _html_table(headers, rows):
+    """Compact HTML table (Qt rich-text) from a header list and a list of cell-
+    string rows; used for the fit-info panel."""
+    head = ''.join(f'<th style="padding:1px 8px;">{h}</th>' for h in headers)
+    body = ''.join('<tr>' + ''.join(f'<td style="padding:1px 8px;">{c}</td>'
+                                    for c in r) + '</tr>' for r in rows)
+    return f'<table style="border-collapse:collapse;"><tr>{head}</tr>{body}</table>'
+
+WINDOWS = ['None', 'Hann', 'Hamming', 'Blackman', 'Bartlett', 'Flat-top',
+           'Kaiser', 'Gaussian', 'Tukey']
+ZEROFILL = ['None', '×2', '×4', '×8', 'Next pow₂']
+FILTERS = ['Low-pass', 'High-pass', 'Band-pass']
+
+# Bare SI units worth auto-prefixing on the plot axes: a plain 's' axis with a
+# 2e-9 step should read '2 ns', not '2e-9 s'. Already-prefixed units ('ns',
+# 'MHz', 'mV') and dimensionless labels are shown verbatim, since auto-prefixing
+# them would double up ('kns', 'GMHz').
+SI_BASE_UNITS = {'s', 'hz', 'v', 'a', 'g', 't', 'k', 'm', 'ev'}
+
+
+def _si_autoprefix(unit):
+    """True if `unit` is a bare SI base worth pyqtgraph auto-prefixing."""
+    return str(unit).strip().lower() in SI_BASE_UNITS
+
+SI_PREFIXES = {'n': 1e-9, 'u': 1e-6, 'µ': 1e-6, 'μ': 1e-6, 'm': 1e-3,
+               'k': 1e3, 'M': 1e6, 'G': 1e9}
+
+def _set_autoprefix(axis, on):
+    """Switch pyqtgraph auto-SI-prefixing on an axis; off also clears the prefix
+    and tick scale pyqtgraph keeps from the last range ('k%' after a kG axis)."""
+    axis.enableAutoSIPrefix(on)
+    if not on:
+        axis.autoSIPrefixScale = 1.0
+        axis.setLabel(axis.labelText, units=axis.labelUnits, unitPrefix='')
+
+def _si_base(unit):
+    """(factor, base unit) for a prefixed SI unit — 'ns' → (1e-9, 's'), 'MHz' →
+    (1e6, 'Hz') — and (1, unit) for a bare base or a non-SI label."""
+    u = str(unit).strip()
+    if len(u) >= 2 and u[0] in SI_PREFIXES and u[1:].lower() in SI_BASE_UNITS:
+        return SI_PREFIXES[u[0]], u[1:]
+    return 1.0, u
+
+# relaxation models exposed in the per-trace Fit tab (a curated subset of the
+# shared fitter; for T1/T2 decays k / k1 / k2 are the time constants).
+RELAX_MODELS = ['Exponential', 'Bi-exponential', 'Stretched exponential']
+RELAX_LABELS = ['Exponential', 'Bi-exponential', 'Stretched exp.']
+
+from atomize.treatment.paths import BUFFER_PATH, BUFFER_2D_PATH, lastdir_path
+
+# shared with the 1D tool and DEER analysis
+LASTDIR_PATH = lastdir_path('treatment')
+
+DATA_SAVE_FILTERS = ('CSV (*.csv)', 'HDF5 (*.h5)')
+
+
+def _load_last_dir():
+    try:
+        with open(LASTDIR_PATH, 'r', errors='ignore') as fh:
+            d = fh.read().strip()
+        return d if d and os.path.isdir(d) else ''
+    except Exception:
+        return ''
+
+
+def _save_last_dir(path):
+    try:
+        d = path if os.path.isdir(path) else os.path.dirname(path)
+        if d:
+            with open(LASTDIR_PATH, 'w') as fh:
+                fh.write(d)
+    except Exception:
+        pass
+
+# Per-tab explanations. These live behind the '?' chip on each tab rather than
+# on the layout, where they used to outweigh the controls they describe.
+_HELP_PHASE = (
+    'Time domain: constant phase in degrees and frequency shift in MHz. '
+    'Frequency domain: φ(f) = φ₀ + a(f − pivot) + b(f − pivot)², with f in MHz '
+    'and φ in degrees. Use FFT → Result → input before spectral correction '
+    'of time-domain data. Each mode keeps its own settings.')
+
+_HELP_FFT = (
+    'Complex FFT of I+iQ along the chosen axis (or both for a 2D transform); '
+    'that axis becomes frequency. ns → MHz. Skip pts drops leading X points so '
+    'the transform starts at the echo centre (removes the dead-time '
+    'first-order phase).<br><br>'
+    'The advanced passband masks the spectrum and leaves the result in the '
+    'frequency domain; the Filter tab transforms back instead. Cutoffs are '
+    'fractions of that axis\' maximum (Nyquist) frequency.')
+
+_HELP_FILTER = (
+    'FFT → zero the frequencies outside the passband → inverse FFT, along the '
+    'chosen axis. Output is the cleaned I/Q data on the same axes; "Both" '
+    'applies the X and Y filters independently.<br><br>'
+    'Low-pass uses the high cutoff; High-pass uses the low cutoff; Band-pass '
+    'uses both. Cutoffs are fractions of that axis\' maximum (Nyquist) '
+    'frequency, set by its own point step.')
+
+_HELP_SHEAR = (
+    'Straightens a tilted dipolar ridge: V′(t_dip, t) = V(t_dip + k·(t − '
+    't_ref), t), done as the exact phase ramp exp(2πi·ν_dip·k·(t − t_ref)) on '
+    'the dipolar-axis spectrum — unitary, no interpolation loss. k is the '
+    'ridge slope dt_dip/dt (1/2 for SIFTER). When both axes are time, shear '
+    'coordinates and the fit window use ns, so k is dimensionless.<br><br>'
+    'Order matters, chaining each step with "Result → input": Phase tab, '
+    'mode = time domain, Frequency shift = the nominal IF in MHz → X low-pass → '
+    'Phase tab for Frequency shift Auto (including constant phase) → shear. This is not '
+    'optional: the nominal IF is off by a few hundred kHz, which twists the '
+    'phase across the echo and cancels part of the very modulation the shear '
+    'is recovering. Measure it <b>after</b> the low-pass — on a raw IF record '
+    'the carrier estimate is swamped by out-of-band noise. Afterwards collapse '
+    'the sheared map with "Sum echo → 1D", which sums over t_ref ± the fit '
+    'window and hands the dipolar trace to the 1D (or DEER) window. The ramp '
+    'is circular, so rows wrap at the '
+    'ends of the dipolar axis; keep the edges out of the analysis.<br><br>'
+    '"Slope estimator" picks how "Fit k" measures k. The shear search maximises '
+    'the summed peak, which changes only quadratically with the error in k, so '
+    'it is flat when the echo is short compared with the dipolar period '
+    '(typical DEER). The cross-correlation tracks where the dipolar ridge sits '
+    'in each echo column and fits a line, which is linear in the error and '
+    'resolves k there; it reads the real part, so phase the record first '
+    '(Auto shear already has).<br><br>'
+    '"Auto shear" walks that whole chain from the raw record on its own, '
+    'taking the IF from the file header and the low-pass cutoff from it; the '
+    'Phase / Filter tabs are left showing what it ran.')
+
+_HELP_FIT = (
+    'Fit every trace along the decay axis with a relaxation model. The chosen '
+    'parameter is plotted vs the other axis as a 1D map (e.g. T<sub>m</sub> vs '
+    'field). For k / k1 / k2 the value is the time constant in the decay-axis '
+    'units. Nonuniform delay grids, including logarithmic T1, are fitted at '
+    'their exact saved times; the heatmap shows these grids by point index.')
+
+_HELP_SLICE = (
+    'Send one trace to the standalone 1D Data Treatment window for fitting / '
+    'phasing there. Pick the slice direction and the trace number (1-based, '
+    'matching the heatmap cursor label). The trace is written to the transfer '
+    'buffer only (not the main GUI), as an I/Q pair; then click "Load from '
+    'plot" in the 1D window.<br><br>'
+    '"Average up to" averages the whole index range before sending. To collapse '
+    'a sheared map over its echo window instead, use "Sum echo → 1D" on the '
+    'Shear tab, which already knows t_ref and the window.')
+
+_HELP_RESHAPE = (
+    'Folds a flattened 2D delay grid into a map, e.g. raw HYSCORE with one echo '
+    'trace per (t1, t2) point and trace index i₂·N₁ + i₁ (t1 fastest). Each '
+    'trace is integrated as I+iQ over the X window [from, to) — the sum times '
+    'the X step, as in the acquisition; From = To takes the whole trace — and '
+    'the integrals become an N₂ × N₁ map with t1 along the new X and t2 along '
+    'the new Y. Raw traces sit at the IF, so demodulate them first.<br><br>'
+    '<b>Delay/length vs field:</b> N₁, the integration window and both map axes '
+    'are read from the experimental header. Logarithmic T1 delays are retained '
+    'exactly for Fit, Slice and saving; the preview uses point indices. '
+    'Open *_map.h5 directly for an already integrated map.<br><br>'
+    '<b>3pESEEM (T, tau):</b> T is the fast X axis and tau the slow Y axis; '
+    'N₁, both starts and independent steps are read from the header. '
+    'Demodulate the raw file before Reshape, or open *_map.h5 directly.<br><br>'
+    '<b>HYSCORE</b>, map file (*_map.h5 or its CSV):<br>'
+    '1. Open I/Q (CSV / HDF5)….<br>'
+    '2. Background tab: Axis Both, Model Polynomial, Order 3 (or Exponential) → '
+    'Subtract → Result → input.<br>'
+    '3. FFT tab: Transform axis Both (2D), Window Hann, Echo center 0 pts, '
+    'Zero fill ×2, Magnitude on → Compute FFT.<br>'
+    '4. Read the cross peaks with the cursor.<br><br>'
+    'Raw file (hyscore_2d_h5.py): after step 1, Phase tab: Time-domain, '
+    'Frequency shift (pre-filled from the header\'s Frequency Shift line) → '
+    'Apply correction → Result → input; then this tab (window pre-filled from '
+    'the header) → Reshape → Result → input; then steps 2–4.')
+
+_HELP_BACKGROUND = (
+    'Fits a smooth background to every trace and subtracts it, I and Q '
+    'separately; the axes are unchanged. It removes the unmodulated decay that '
+    'otherwise dominates the spectrum near 0 MHz. Exponential is a + b·exp(−t/T) '
+    'per trace, with T taken from a grid. Typical use: HYSCORE, Axis Both, '
+    'Polynomial 3 or Exponential, before the FFT.')
+
+# parametric windows: name -> (label, min, max, decimals, default, step)
+WINDOW_PARAM = {
+    'Kaiser':   ('Kaiser β', 0.0, 100.0, 2, 8.6, 0.5),
+    'Gaussian': ('Gaussian σ (×N)', 0.01, 1.0, 3, 0.15, 0.01),
+    'Tukey':    ('Tukey α', 0.0, 1.0, 3, 0.5, 0.05),
+}
+
+
+class MainWindow(QMainWindow):
+
+    def __init__(self, *args, **kwargs):
+        super(MainWindow, self).__init__(*args, **kwargs)
+
+        if len(sys.argv) > 1:
+            self.test_flag = sys.argv[1]
+        else:
+            self.test_flag = 'None'
+
+        self.opener = openfile.Saver_Opener()
+        self.bruker = bruker.Bruker_Opener()
+        self.fitter = fitting.math()
+        self.fit_map = None        # last per-trace fit result (dict)
+        self._fitting = False      # re-entry guard for the per-trace fit loop
+        self._cancel_fit = False   # set by the Cancel button to stop the loop
+
+        # complex data as two real channels, each a [trace, point] matrix.
+        # raw_*  = as loaded; src_* = current input to operations (= raw after a
+        # load / reset, or a promoted result); res_* = current operation output.
+        self.raw_i = self.raw_q = None
+        self._src_file = None      # as-read matrices + axis specs, before the Source options
+        self.src_i = self.src_q = None
+        self.src_col = self.src_row = None     # axis dicts (see _axis)
+        self._raw_axis_values = (None, None)
+        self._reshape_axis_values = (None, None)
+        self.res_i = self.res_q = None
+        self.res_col = self.res_row = None
+        self.res_frames = ('I', 'Q')
+        self.res_meta = []
+        self._suppress_live = False
+        self.last_dir = _load_last_dir()   # start file dialogs in the last folder
+
+        # '#'-header of the loaded dataset + its name (empty for a plot load)
+        self.header_lines = []
+        self.header_name = ''
+        self.header_window = None          # created on first use, then reused
+
+        self.design()
+        self.load_from_plot(silent=True)   # consume a pending buffer on startup
+        self._init_buffer_watch()          # auto-load new data while open
+
+    def _init_buffer_watch(self):
+        """Watch the buffer folder so a 2D plot sent from the main GUI while this
+        window is already open is picked up automatically (no "Load from plot"
+        click needed). A short debounce lets the writer finish before we read;
+        the timer also coalesces the create/modify/delete burst into one load."""
+        self._buf_timer = QTimer(self)
+        self._buf_timer.setSingleShot(True)
+        self._buf_timer.setInterval(200)
+        self._buf_timer.timeout.connect(self._on_buffer_ready)
+        self._buf_watcher = QFileSystemWatcher(self)
+        watch_dir = os.path.dirname(BUFFER_2D_PATH)
+        if os.path.isdir(watch_dir):
+            self._buf_watcher.addPath(watch_dir)
+        self._buf_watcher.directoryChanged.connect(lambda _p: self._buf_timer.start())
+
+    def _on_buffer_ready(self):
+        if os.path.isfile(BUFFER_2D_PATH):
+            self.load_from_plot(silent=True)
+
+    # ----------------------------------------------------------------- UI
+    def design(self):
+        self.setWindowTitle('2D Data Treatment')
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'gui', 'icon_treat2d.ico')
+        self.setWindowIcon(QIcon(icon_path))
+        self.resize(1040, 720)
+        # background on the QMainWindow (as in awg_phasing_insys.py) rather than
+        # the central widget, so spinboxes keep their full native frame.
+        self.setStyleSheet(f"background-color: {BG};")
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setSpacing(gf.PANEL_GAP)
+
+        # ---- Left: embedded preview (in-process) — same CrossSectionDock
+        # (heatmap + X/Y cross-sections) as the main GUI, for consistency. ----
+        self.plot_area = DockArea()
+        self.cross_dock = CrossSectionDock(name='Preview')
+        self.cross_dock.close_button.hide()
+        self.plot_area.addDock(self.cross_dock)
+        # Follow the heatmap crosshair with the Slice-tab "Trace #": the dock's
+        # own handler updates its cross indices first (connected in __init__), so
+        # this slot, connected after, reads the fresh values. (Slice widgets are
+        # built later in design(); the slot only fires on user mouse moves.)
+        self.cross_dock.imageItem.scene().sigMouseMoved.connect(self._sync_slice_from_cursor)
+        root.addWidget(self.plot_area, stretch=3)
+        self._disable_si_prefix()
+        # ---- end preview ----
+
+        # ---- Vertical separator between graph and controls ----
+        root.addWidget(gf.vline())
+
+        # ---- Right: controls ----
+        panel = QVBoxLayout()
+        panel.setContentsMargins(*gf.PANEL_MARGINS)
+        panel.setSpacing(8)
+        root.addLayout(panel, stretch=2)
+
+        # ---- Source ----
+        panel.addWidget(self._heading('Source (I/Q 2D)'))
+        btn_open = QPushButton('Open I/Q (CSV / HDF5)…')
+        btn_open.setStyleSheet(BUTTON_STYLE)
+        btn_open.clicked.connect(self.open_iq)
+        btn_bruker = QPushButton('Open Bruker…')
+        btn_bruker.setStyleSheet(BUTTON_STYLE)
+        btn_bruker.clicked.connect(self.open_bruker)
+        btn_buf = QPushButton('Load from plot')
+        btn_buf.setStyleSheet(BUTTON_STYLE)
+        btn_buf.clicked.connect(lambda: self.load_from_plot(silent=False))
+        btn_clear = QPushButton('Clear')
+        btn_clear.setStyleSheet(BUTTON_STYLE)
+        btn_clear.clicked.connect(self.clear_all)
+        # source actions and the File row share a 4-column grid, so Header…
+        # comes out exactly as wide as Clear (a 3:1 stretch cannot: it has one
+        # gap where the button row has three)
+        src_grid = gf.equal_grid(4)
+        for i, b in enumerate((btn_open, btn_bruker, btn_buf, btn_clear)):
+            src_grid.addWidget(b, 0, i)
+        panel.addLayout(src_grid)
+
+        # Name of the dataset currently loaded (file basename, or 'Loaded from
+        # plot' for the in-memory buffer).
+        self.loaded_label = gf.hint('File: —')
+        self.header_btn = QPushButton('Header…')
+        self.header_btn.setStyleSheet(BUTTON_STYLE)
+        self.header_btn.clicked.connect(self.show_header)
+        src_grid.addWidget(self.loaded_label, 1, 0, 1, 3)
+        src_grid.addWidget(self.header_btn, 1, 3)
+
+        head = gf.FormPanel(field_width=gf.FIELD_W,
+                            button_width=gf.BTN_W)
+        self.transpose_check = head.add_check(
+            'Transpose on load',
+            tooltip='Swap the trace and point axes as the file is read.')
+        self.tr_epr_check = head.add_check(
+            'TR EPR: remove off-resonance',
+            tooltip='Row 0 of a TR EPR file is the off-resonance reference '
+                    'trace, not a field point. Subtract it from every trace, '
+                    "subtract each trace's first time sample and drop it — "
+                    "bit-identical to the main window's Open TR Data. "
+                    'Every remaining trace then lands on the field it was '
+                    'measured at. Toggle any time: the source is re-read.')
+        for c in (self.transpose_check, self.tr_epr_check):
+            c.toggled.connect(self._on_source_option)
+
+        # ---- Axis metadata (reconstructed by hand; no .param) ----
+        head.add_heading('Axes')
+        self.xname_edit = QLineEdit('Time'); self.xname_edit.setStyleSheet(LINEEDIT_STYLE)
+        self.xscale_edit = QLineEdit('ns');  self.xscale_edit.setStyleSheet(LINEEDIT_STYLE)
+        head.add_row('X (within trace)', self.xname_edit, self.xscale_edit,
+                     stretch=[2, 1])
+        self.x0_spin = self._dspin(-1e12, 1e12, 3, 0.0)
+        self.dx_spin = self._dspin(-1e12, 1e12, 3, 0.4)
+        head.add_row('X start / step', self.x0_spin, self.dx_spin)
+        self.yname_edit = QLineEdit('Delay'); self.yname_edit.setStyleSheet(LINEEDIT_STYLE)
+        self.yscale_edit = QLineEdit('ns');   self.yscale_edit.setStyleSheet(LINEEDIT_STYLE)
+        head.add_row('Y (indirect)', self.yname_edit, self.yscale_edit,
+                     stretch=[2, 1])
+        self.y0_spin = self._dspin(-1e12, 1e12, 3, 0.0)
+        self.dy_spin = self._dspin(-1e12, 1e12, 3, 3.2)
+        head.add_row('Y start / step', self.y0_spin, self.dy_spin)
+        panel.addWidget(head)
+        # title / unit edits only relabel the current plot in place (keep the
+        # result); start / step edits change the geometry, so they reset to raw.
+        for w in (self.xname_edit, self.xscale_edit, self.yname_edit, self.yscale_edit):
+            w.textChanged.connect(self.on_axis_labels_changed)
+        for s in (self.x0_spin, self.dx_spin, self.y0_spin, self.dy_spin):
+            s.valueChanged.connect(self.on_axes_changed)
+
+        self.live_check = gf.live_update_checkbox()
+        panel.addWidget(self.live_check)
+
+        panel.addWidget(self._hline())
+
+        # ---- Operation tabs ----
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(ANALYSIS_TAB_STYLE)
+        self.tabs.tabBar().setUsesScrollButtons(False)
+        self.tabs.addTab(self._build_phase_tab(), 'Phase')
+        self.tabs.addTab(self._build_fft_tab(), 'FFT')
+        self.tabs.addTab(self._build_filter_tab(), 'Filter')
+        self.tabs.addTab(self._build_shear_tab(), 'Shear')
+        self.tabs.addTab(self._build_fit_tab(), 'Fit')
+        self.tabs.addTab(self._build_slice_tab(), 'Slice')
+        self.tabs.addTab(self._build_reshape_tab(), 'Reshape')
+        self.tabs.addTab(self._build_background_tab(), 'Background')
+        # Tab changes deliberately do NOT trigger _live_update: re-running the
+        # new tab's op on switch is redundant and, after a "Result → input"
+        # chain, would re-transform an already-transformed input (e.g. FFT of an
+        # FFT). The preview recomputes only on a parameter change or Apply.
+        panel.addWidget(self.tabs, stretch=1)
+
+        panel.addWidget(self._hline())
+
+        # ---- Output ----
+        panel.addWidget(self._heading('Output'))
+        self.name_edit = QLineEdit('FT Data 2D')
+        self.name_edit.setStyleSheet(LINEEDIT_STYLE)
+        self.name_edit.editingFinished.connect(self._push_current)
+        panel.addWidget(self.name_edit)
+        out_row = QHBoxLayout()
+        btn_apply = QPushButton('Apply && plot')
+        btn_apply.setStyleSheet(BUTTON_STYLE)
+        btn_apply.clicked.connect(self._apply_current_op)
+        btn_chain = QPushButton('Result → input')
+        btn_chain.setStyleSheet(BUTTON_STYLE)
+        btn_chain.clicked.connect(self.promote_result)
+        btn_reset = QPushButton('Reset to raw')
+        btn_reset.setStyleSheet(BUTTON_STYLE)
+        btn_reset.clicked.connect(self.reset_to_raw)
+        btn_save = QPushButton('Save I/Q…')
+        btn_save.setStyleSheet(BUTTON_STYLE)
+        btn_save.clicked.connect(self.save_result)
+        btn_chain.setFixedHeight(btn_save.sizeHint().height())
+        out_row.addWidget(btn_apply); out_row.addWidget(btn_chain)
+        out_row.addWidget(btn_reset); out_row.addWidget(btn_save)
+        panel.addLayout(out_row)
+
+        self.status = gf.hint('Open an I/Q 2D dataset (name.csv + name_1.csv, or name.h5).')
+        panel.addWidget(self.status)
+
+        gf.apply_row_metrics(self)
+
+    # ---- small helpers ----
+    def _hline(self):
+        return gf.hline()
+
+    def _heading(self, text):
+        return gf.heading(text)
+
+    def _label(self, text):
+        return gf.label(text)
+
+    def _dspin(self, lo, hi, dec, val, step=None):
+        s = QDoubleSpinBox(); s.setStyleSheet(DSPIN_STYLE)
+        s.setDecimals(dec); s.setRange(lo, hi)
+        if step is not None:
+            s.setSingleStep(step)
+        s.setValue(val)
+        return s
+
+    def _combo(self, items):
+        c = QComboBox(); c.setStyleSheet(COMBO_STYLE); c.addItems(items)
+        return c
+
+    @staticmethod
+    def _axis(start, step, name, scale, auto=False, values=None):
+        # auto=True marks an axis whose label is owned by an operation (e.g. the
+        # FFT frequency axis), so manual title/unit edits leave it untouched.
+        return {'start': float(start), 'step': float(step),
+                'name': str(name), 'scale': str(scale), 'auto': bool(auto),
+                'values': values}
+
+    @staticmethod
+    def _axis_values(ax, size):
+        """Physical coordinates, including an explicit nonuniform grid."""
+        values = ax.get('values')
+        return np.asarray(values) if values is not None else ax['start'] + ax['step']*np.arange(size)
+
+    def _require_uniform(self, *axes):
+        """Reject operations that require equally spaced samples."""
+        for ax in axes:
+            if ax.get('values') is not None:
+                self.set_status(f'{ax["name"]} has nonuniform spacing; this operation requires '
+                                'a uniform grid. Fit, Slice and phase correction use the exact coordinates.')
+                return False
+        return True
+
+    # ---- tabs ----
+    def _build_phase_tab(self):
+        p = gf.FormPanel(field_width=gf.FIELD_W, button_width=gf.BTN_W)
+        p.add_title('Phase-correct I+iQ along X', help=_HELP_PHASE)
+        self.phase_mode = self._combo(['Time-domain', 'Frequency-domain'])
+        self.phase_mode.setToolTip('Follows the input X-axis units when the input changes.')
+        p.add_row('Mode', self.phase_mode)
+        self.phase_time_panel = gf.FormPanel(field_width=gf.FIELD_W,
+                                             button_width=gf.BTN_W)
+        self.phase_freq_panel = gf.FormPanel(field_width=gf.FIELD_W,
+                                             button_width=gf.BTN_W)
+        p.add_widget(self.phase_time_panel)
+        p.add_widget(self.phase_freq_panel)
+        self.phase_zero = self._dspin(0.0, 360.0, 2, 0.0, step=0.5)
+        self.phase_zero.setSuffix(' deg')
+        self.phase_zero.setWrapping(True)
+        self.phase_zero.valueChanged.connect(self._live_update)
+        btn_zero = QPushButton('Auto')
+        btn_zero.setStyleSheet(BUTTON_STYLE)
+        btn_zero.setToolTip('Estimate the constant phase after the frequency shift.')
+        btn_zero.clicked.connect(self.auto_phase_zero)
+        self.phase_time_panel.add_row('Constant phase', self.phase_zero, btn_zero,
+                                      stretch=[3, 1])
+        self.phase_first = self._dspin(-1e6, 1e6, 3, 0.0, step=0.05)
+        self.phase_first.setSuffix(' MHz')
+        self.phase_first.valueChanged.connect(self._live_update)
+        btn_shift = QPushButton('Auto')
+        btn_shift.setStyleSheet(BUTTON_STYLE)
+        btn_shift.setToolTip('Estimate the shift that removes the carrier, then '
+                             'estimate the constant phase. For raw IF data, '
+                             'shift by the nominal IF and low-pass first.')
+        btn_shift.clicked.connect(self.auto_phase_first)
+        self.phase_time_panel.add_row('Frequency shift', self.phase_first, btn_shift,
+                                       stretch=[3, 1],
+                                       tooltip='Positive values shift toward higher frequency.')
+        self.phase_freq_zero = self._dspin(0.0, 360.0, 2, 0.0, step=0.5)
+        self.phase_freq_zero.setSuffix(' deg')
+        self.phase_freq_zero.setWrapping(True)
+        self.phase_freq_zero.valueChanged.connect(self._live_update)
+        btn_freq_zero = QPushButton('Auto')
+        btn_freq_zero.setStyleSheet(BUTTON_STYLE)
+        btn_freq_zero.setToolTip('Estimate zero-order phase with the entered '
+                                 'first and second orders already applied.')
+        btn_freq_zero.clicked.connect(self.auto_phase_zero)
+        self.phase_freq_panel.add_row('Zero order', self.phase_freq_zero,
+                                      btn_freq_zero, stretch=[3, 1])
+        self.phase_freq_first = self._dspin(-1e6, 1e6, 3, 0.0, step=0.05)
+        self.phase_freq_first.setSuffix(' deg/MHz')
+        self.phase_freq_first.valueChanged.connect(self._live_update)
+        self.phase_freq_panel.add_row('First order', self.phase_freq_first)
+        adv = self.phase_freq_panel.add_advanced()
+        adv.field_width, adv.button_width = gf.FIELD_W, gf.BTN_W
+        self.phase_freq_second = self._dspin(-1e6, 1e6, 4, 0.0, step=0.001)
+        self.phase_freq_second.setSuffix(' deg/MHz²')
+        self.phase_freq_second.valueChanged.connect(self._live_update)
+        adv.add_row('Second order', self.phase_freq_second)
+        self.phase_pivot = self._dspin(-1e9, 1e9, 6, 0.0, step=0.1)
+        self.phase_pivot.setSuffix(' MHz')
+        self.phase_pivot.valueChanged.connect(self._live_update)
+        adv.add_row('Pivot frequency', self.phase_pivot)
+        self.phase_mode.currentIndexChanged.connect(self._update_phase_mode)
+        self.phase_mode.currentIndexChanged.connect(self._live_update)
+        self._update_phase_mode()
+        btn = QPushButton('Apply correction')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_phase)
+        p.add_button_row(btn, width=gf.ACTION_W)
+        p.add_stretch()
+        return p
+
+    def _update_phase_mode(self, *args):
+        frequency = self.phase_mode.currentIndex() == 1
+        self.phase_time_panel.setVisible(not frequency)
+        self.phase_freq_panel.setVisible(frequency)
+
+    def _sync_phase_mode(self):
+        """Follow the input X axis without running another operation."""
+        if self.src_col is None:
+            return
+        for mode, convert in enumerate((fft_module.time_axis_ns, fft_module.frequency_axis_mhz)):
+            try:
+                convert(0, self.src_col['scale'])
+            except ValueError:
+                continue
+            blocked = self.phase_mode.blockSignals(True)
+            self.phase_mode.setCurrentIndex(mode)
+            self.phase_mode.blockSignals(blocked)
+            self._update_phase_mode()
+            return
+
+    def _build_fft_tab(self):
+        p = gf.FormPanel(field_width=gf.FIELD_W,
+                         button_width=gf.BTN_W)
+        p.add_title('Complex FFT of I+iQ along an axis', help=_HELP_FFT)
+
+        self.fft_axis = self._combo(['X (within trace)', 'Y (indirect)', 'Both (2D)'])
+        self.fft_axis.currentIndexChanged.connect(self._update_fft_passband)
+        self.fft_axis.currentIndexChanged.connect(self._live_update)
+        p.add_row('Transform axis', self.fft_axis)
+
+        self.fft_window = self._combo(WINDOWS)
+        p.add_row('Window', self.fft_window)
+        self.fft_winparam_label = self._label('Window param')
+        self.fft_winparam = self._dspin(0.0, 100.0, 2, 8.6)
+        p.add_row(self.fft_winparam_label, self.fft_winparam)
+        self.fft_window.currentIndexChanged.connect(self._update_winparam)
+        self.fft_window.currentIndexChanged.connect(self._live_update)
+        self.fft_winparam.valueChanged.connect(self._live_update)
+
+        self.fft_skip = QSpinBox(); self.fft_skip.setStyleSheet(SPIN_STYLE)
+        self.fft_skip.setRange(0, 1000000)
+        self.fft_skip.setSuffix(' pts')
+        self.fft_skip.setToolTip(
+            'Number of leading <b>points</b> (samples, not time) to drop along '
+            'the transform axis so it starts at the echo centre.')
+        self.fft_skip.valueChanged.connect(self._live_update)
+        btn_auto = QPushButton('Auto')
+        btn_auto.setStyleSheet(BUTTON_STYLE)
+        btn_auto.setToolTip(
+            'Estimate the echo centre and fill "skip pts" with its <b>point '
+            'index</b> (a sample number, not a time).<br><br>'
+            'Taken from the |I+iQ| envelope averaged over the non-transform '
+            'axis (so the field-offset modulation cancels): the peak sample, '
+            'refined by a centre-of-mass over the symmetric core around it (so '
+            'a slow one-sided FID decay tail does not drag it off the peak).')
+        btn_auto.clicked.connect(self.auto_echo_center)
+        p.add_row('Echo center', self.fft_skip, btn_auto, stretch=[3, 1])
+
+        self.fft_zerofill = self._combo(ZEROFILL)
+        self.fft_zerofill.setCurrentText('×2')
+        self.fft_zerofill.currentIndexChanged.connect(self._live_update)
+        p.add_row('Zero fill', self.fft_zerofill)
+
+        self.fft_mag = p.add_check('Magnitude', tooltip='Show |S| instead of Re / Im.')
+        self.fft_mag.toggled.connect(self._live_update)
+
+        adv = p.add_advanced()
+        adv.field_width, adv.button_width = gf.FIELD_W, gf.BTN_W
+        (self.fft_x_head, self.fft_x_type, self.fft_x_lo_label, self.fft_x_lo,
+         self.fft_x_hi_label, self.fft_x_hi) = self._passband_rows(adv, 'X')
+        (self.fft_y_head, self.fft_y_type, self.fft_y_lo_label, self.fft_y_lo,
+         self.fft_y_hi_label, self.fft_y_hi) = self._passband_rows(adv, 'Y')
+
+        btn = QPushButton('Compute FFT')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_fft)
+        p.add_button_row(btn, width=gf.ACTION_W)
+        p.add_stretch()
+        self._update_winparam()
+        self._update_fft_passband()
+        return p
+
+    def _passband_rows(self, panel, name):
+        """Passband type + low/high cutoff rows for one axis of the FFT tab;
+        returns the widgets so the inactive axis' rows can be hidden."""
+        head = self._label(f'{name} passband')
+        ftype = self._combo(['None'] + FILTERS)
+        ftype.currentIndexChanged.connect(self._live_update)
+        panel.add_row(head, ftype)
+        lo_label = self._label(f'{name} low cutoff')
+        lo = self._dspin(0.0, 1.0, 4, 0.0, 0.01)
+        lo.setSuffix(' ×f_max')
+        lo.valueChanged.connect(self._live_update)
+        panel.add_row(lo_label, lo)
+        hi_label = self._label(f'{name} high cutoff')
+        hi = self._dspin(0.0, 1.0, 4, 1.0, 0.01)
+        hi.setSuffix(' ×f_max')
+        hi.valueChanged.connect(self._live_update)
+        panel.add_row(hi_label, hi)
+        return head, ftype, lo_label, lo, hi_label, hi
+
+    def _update_fft_passband(self, *args):
+        mode = self.fft_axis.currentIndex()       # 0 = X, 1 = Y, 2 = both
+        for wdg in (self.fft_x_head, self.fft_x_type, self.fft_x_lo_label,
+                    self.fft_x_lo, self.fft_x_hi_label, self.fft_x_hi):
+            wdg.setEnabled(mode != 1)
+            wdg.setVisible(mode != 1)
+        for wdg in (self.fft_y_head, self.fft_y_type, self.fft_y_lo_label,
+                    self.fft_y_lo, self.fft_y_hi_label, self.fft_y_hi):
+            wdg.setEnabled(mode != 0)
+            wdg.setVisible(mode != 0)
+
+    def _update_winparam(self, *args):
+        cfg = WINDOW_PARAM.get(self.fft_window.currentText())
+        self.fft_winparam.blockSignals(True)
+        if cfg is not None:
+            txt, lo, hi, dec, default, step = cfg
+            self.fft_winparam_label.setText(txt)
+            self.fft_winparam.setEnabled(True)
+            self.fft_winparam.setDecimals(dec)
+            self.fft_winparam.setRange(lo, hi)
+            self.fft_winparam.setSingleStep(step)
+            self.fft_winparam.setValue(default)
+        else:
+            self.fft_winparam_label.setText('Window param')
+            self.fft_winparam.setEnabled(False)
+        self.fft_winparam.blockSignals(False)
+        # the row is meaningless for the non-parametric windows: hide it rather
+        # than leave a greyed field on the tab
+        self.fft_winparam_label.setVisible(cfg is not None)
+        self.fft_winparam.setVisible(cfg is not None)
+
+    def _build_filter_tab(self):
+        p = gf.FormPanel(field_width=gf.FIELD_W,
+                         button_width=gf.BTN_W)
+        p.add_title('Mask a frequency band and transform back', help=_HELP_FILTER)
+
+        self.filt_axis = self._combo(['X (within trace)', 'Y (indirect)',
+                                      'Both (independent)'])
+        self.filt_axis.currentIndexChanged.connect(self._update_filter_enable)
+        self.filt_axis.currentIndexChanged.connect(self._live_update)
+        p.add_row('Filter axis', self.filt_axis)
+
+        self.filt_x_head = self._label('X filter')
+        self.filt_x_type = self._combo(FILTERS)
+        self.filt_x_type.currentIndexChanged.connect(self._live_update)
+        p.add_row(self.filt_x_head, self.filt_x_type)
+        self.filt_x_lo_label = self._label('X low cutoff')
+        self.filt_x_lo = self._dspin(0.0, 1.0, 4, 0.1, 0.01)
+        self.filt_x_lo.setSuffix(' ×f_max')
+        self.filt_x_lo.valueChanged.connect(self._live_update)
+        p.add_row(self.filt_x_lo_label, self.filt_x_lo)
+        self.filt_x_hi_label = self._label('X high cutoff')
+        self.filt_x_hi = self._dspin(0.0, 1.0, 4, 0.5, 0.01)
+        self.filt_x_hi.setSuffix(' ×f_max')
+        self.filt_x_hi.valueChanged.connect(self._live_update)
+        p.add_row(self.filt_x_hi_label, self.filt_x_hi)
+
+        self.filt_y_head = self._label('Y filter')
+        self.filt_y_type = self._combo(FILTERS)
+        self.filt_y_type.currentIndexChanged.connect(self._live_update)
+        p.add_row(self.filt_y_head, self.filt_y_type)
+        self.filt_y_lo_label = self._label('Y low cutoff')
+        self.filt_y_lo = self._dspin(0.0, 1.0, 4, 0.1, 0.01)
+        self.filt_y_lo.setSuffix(' ×f_max')
+        self.filt_y_lo.valueChanged.connect(self._live_update)
+        p.add_row(self.filt_y_lo_label, self.filt_y_lo)
+        self.filt_y_hi_label = self._label('Y high cutoff')
+        self.filt_y_hi = self._dspin(0.0, 1.0, 4, 0.5, 0.01)
+        self.filt_y_hi.setSuffix(' ×f_max')
+        self.filt_y_hi.valueChanged.connect(self._live_update)
+        p.add_row(self.filt_y_hi_label, self.filt_y_hi)
+
+        btn = QPushButton('Apply filter')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_filter)
+        p.add_button_row(btn, width=gf.ACTION_W)
+        p.add_stretch()
+        self._update_filter_enable()
+        return p
+
+    def _update_filter_enable(self, *args):
+        mode = self.filt_axis.currentIndex()      # 0 = X, 1 = Y, 2 = both
+        # the inactive axis' rows are hidden, not greyed: in single-axis mode
+        # that is four dead rows off the tab
+        for wdg in (self.filt_x_head, self.filt_x_type, self.filt_x_lo_label,
+                    self.filt_x_lo, self.filt_x_hi_label, self.filt_x_hi):
+            wdg.setEnabled(mode != 1)
+            wdg.setVisible(mode != 1)
+        for wdg in (self.filt_y_head, self.filt_y_type, self.filt_y_lo_label,
+                    self.filt_y_lo, self.filt_y_hi_label, self.filt_y_hi):
+            wdg.setEnabled(mode != 0)
+            wdg.setVisible(mode != 0)
+
+    def _build_shear_tab(self):
+        p = gf.FormPanel(field_width=gf.FIELD_W,
+                         button_width=gf.BTN_W)
+        p.add_title('Straighten a tilted dipolar ridge', help=_HELP_SHEAR)
+
+        self.shear_axis = self._combo(['Y (indirect)', 'X (within trace)'])
+        self.shear_axis.currentIndexChanged.connect(self._live_update)
+        p.add_row('Dipolar axis', self.shear_axis,
+                  tooltip='The axis the ramp shifts.')
+
+        self.shear_k = self._dspin(-5.0, 5.0, 4, 0.5, 0.01)
+        self.shear_k.valueChanged.connect(self._live_update)
+        btn_fit = QPushButton('Fit k')
+        btn_fit.setStyleSheet(BUTTON_STYLE)
+        btn_fit.setToolTip('Estimate k with the "Slope estimator" below. Shear search: '
+                           'scan k, shear, sum over the echo axis and take the k that '
+                           'maximises the recovered peak (parabolic refine around the '
+                           'grid maximum). Cross-correlation: fit a line to the ridge '
+                           'shift of each echo column. Uses the fit window below.')
+        btn_fit.clicked.connect(self.fit_shear_slope)
+        p.add_row('Slope k', self.shear_k, btn_fit, stretch=[3, 1],
+                  tooltip='Ridge slope dt_dip/dt (1/2 for SIFTER).')
+
+        self.shear_tref = self._dspin(-1e12, 1e12, 3, 0.0, 1.0)
+        self.shear_tref.valueChanged.connect(self._live_update)
+        btn_ref = QPushButton('Auto')
+        btn_ref.setStyleSheet(BUTTON_STYLE)
+        btn_ref.setToolTip('Set t_ref to the echo centre of the |I+iQ| envelope averaged '
+                           'over the dipolar axis. t_ref only translates the dipolar '
+                           'axis — it does not change the recovered amplitude, but it '
+                           'does set the absolute zero of the dipolar time.')
+        btn_ref.clicked.connect(self.auto_shear_ref)
+        p.add_row('Shear origin t_ref', self.shear_tref, btn_ref, stretch=[3, 1])
+
+        self.shear_fitwin = self._dspin(0.0, 1e12, 1, 140.0, 10.0)
+        self.shear_fitwin.setToolTip('Echo-axis half-width used by "Fit k" only '
+                                     '(0 = the whole window). The low-S/N wings of the '
+                                     'echo otherwise dilute the figure of merit.')
+        adv = p.add_advanced()
+        adv.field_width, adv.button_width = gf.FIELD_W, gf.BTN_W
+        adv.add_row('Fit window ±', self.shear_fitwin)
+        self.shear_estimator = self._combo(['Shear search', 'Cross-correlation'])
+        adv.add_row('Slope estimator', self.shear_estimator,
+                    tooltip='How "Fit k" measures k: maximise the summed peak over '
+                            'a k grid, or track the ridge across the echo columns '
+                            'and fit its slope (better for short echoes, e.g. DEER).')
+
+        btn_auto = QPushButton('Auto shear')
+        btn_auto.setStyleSheet(BUTTON_STYLE)
+        btn_auto.setToolTip(
+            'Run the whole chain below in one click, from the raw record: '
+            'demodulate at the IF read from the file header → X low-pass at '
+            'IF/2 → Auto frequency shift and constant phase → Auto t_ref → Fit k → '
+            'Apply shear.<br><br>'
+            'The IF is the frequency shared by most AWG pulses in the header '
+            '(a DEER pump pulse is outvoted by the three observer pulses); '
+            'without a header the time-domain Frequency shift is used instead. The '
+            'low-pass sits at half the IF, below both the LO leak at the IF '
+            'and the mirror image at twice it.')
+        btn_auto.clicked.connect(self.auto_shear)
+        btn = QPushButton('Apply shear')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_shear)
+        p.add_button_row(btn_auto, btn, width=gf.ACTION_W)
+        btn_sum = QPushButton('Sum echo → 1D')
+        btn_sum.setStyleSheet(BUTTON_STYLE)
+        btn_sum.setToolTip(
+            'Collapse the straightened map: sum every trace over the echo '
+            'window t_ref ± "Fit window" and send the dipolar trace to the 1D '
+            'Data Treatment window (or the DEER window — same buffer) as an '
+            'I/Q pair.<br><br>'
+            'The window is the one the slope was fitted with, so the delivered '
+            'peak is the "flat sum" reported above. For anything else — a '
+            'plain map, another direction, an arbitrary index range, averaged '
+            'rather than summed — use the Slice tab.')
+        btn_sum.clicked.connect(self.collapse_shear)
+        btn_sum.setFixedHeight(btn.sizeHint().height())
+        p.add_button_row(btn_sum, width=gf.ACTION_W)
+        p.add_stretch()
+        return p
+
+    def _build_fit_tab(self):
+        p = gf.FormPanel(field_width=gf.FIELD_W,
+                         button_width=gf.BTN_W)
+        p.add_title('Fit each trace and map a parameter', help=_HELP_FIT)
+
+        self.fit_axis = self._combo(['X (within trace)', 'Y (indirect)'])
+        p.add_row('Decay axis', self.fit_axis)
+
+        self.fit_channel = self._combo(['Real (I)', 'Magnitude', 'Imag (Q)'])
+        p.add_row('Channel', self.fit_channel)
+
+        self.fit_model = self._combo(RELAX_LABELS)
+        self.fit_model.setCurrentIndex(2)
+        self.fit_model.currentIndexChanged.connect(self._update_fit_params)
+        p.add_row('Model', self.fit_model)
+
+        # live equation of the selected model, so the user sees what is fitted
+        self.fit_formula = gf.hint('')
+        p.add_widget(self.fit_formula)
+
+        self.fit_no_offset = p.add_check(
+            'Fix offset = 0',
+            tooltip='Drop the b baseline term from the model.')
+        self.fit_no_offset.stateChanged.connect(self._update_fit_params)
+
+        self.fit_fix_beta = QCheckBox('Fix β =')
+        self.fit_fix_beta.setStyleSheet(CHECKBOX_STYLE)
+        self.fit_fix_beta.setToolTip('Hold the stretch exponent β at this value '
+                                     '(Stretched exponential only).')
+        self.fit_fix_beta.setFixedWidth(gf.LABEL_COL_W - 6 + 8)
+        self.fit_fix_beta.stateChanged.connect(self._update_fit_params)
+        self.fit_beta = self._dspin(0.05, 5.0, 3, 1.0, step=0.05)
+        p.add_row(self.fit_fix_beta, self.fit_beta)
+
+        self.fit_param = self._combo([])
+        p.add_row('Map parameter', self.fit_param)
+
+        self.fit_minr2 = self._dspin(0.0, 1.0, 3, 0.0, step=0.05)
+        adv = p.add_advanced()
+        adv.field_width, adv.button_width = gf.FIELD_W, gf.BTN_W
+        adv.add_row('Min R²', self.fit_minr2,
+                    tooltip='Traces fitting worse than this are dropped from the map.')
+
+        self.fit_run_btn = QPushButton('Run fit')
+        self.fit_run_btn.setStyleSheet(BUTTON_STYLE)
+        self.fit_run_btn.setToolTip(self._FIT_STATS_TOOLTIP)
+        self.fit_run_btn.clicked.connect(self.do_fit_2d)
+        self.fit_cancel_btn = QPushButton('Cancel')
+        self.fit_cancel_btn.setStyleSheet(BUTTON_STYLE)
+        self.fit_cancel_btn.clicked.connect(self.cancel_fit)
+        self.fit_cancel_btn.setEnabled(False)
+        btn_savemap = QPushButton('Save map…')
+        btn_savemap.setStyleSheet(BUTTON_STYLE)
+        btn_savemap.clicked.connect(self.save_fit_map)
+        p.add_button_row(self.fit_run_btn, self.fit_cancel_btn, btn_savemap,
+                         width=gf.ACTION_W)
+
+        self.fit_info = gf.hint('')
+        p.add_widget(self.fit_info)
+        p.add_stretch()
+
+        self._update_fit_params()
+        return p
+
+    def _build_slice_tab(self):
+        p = gf.FormPanel(field_width=gf.FIELD_W,
+                         button_width=gf.BTN_W)
+        p.add_title('Send one trace to the 1D tool', help=_HELP_SLICE)
+
+        self.slice_axis = self._combo(['X (within trace)', 'Y (indirect)'])
+        self.slice_axis.currentIndexChanged.connect(self._update_slice_label)
+        self.slice_axis.currentIndexChanged.connect(self._sync_slice_from_cursor)
+        p.add_row('Slice along', self.slice_axis)
+
+        # 1-based to match the heatmap cursor label (which counts traces/points
+        # from 1); converted to a 0-based array index where the data is sliced.
+        self.slice_spin = QSpinBox(); self.slice_spin.setStyleSheet(SPIN_STYLE)
+        self.slice_spin.setRange(1, 1000000)
+        self.slice_spin.valueChanged.connect(self._update_slice_label)
+        self.slice_label = gf.hint('')
+        p.add_row('Trace #', self.slice_spin, self.slice_label, stretch=[1, 2])
+
+        self.slice_avg = QCheckBox('Average up to')
+        self.slice_avg.setStyleSheet(CHECKBOX_STYLE)
+        self.slice_avg.setToolTip('Average all traces between "Trace #" and this '
+                                  'index (inclusive) before sending — improves SNR.')
+        self.slice_avg.stateChanged.connect(self._update_slice_label)
+        # label column less the cell spacing: its spinbox then sits in the field column
+        self.slice_avg.setFixedWidth(gf.LABEL_COL_W - 6 + 8)
+        self.slice_spin2 = QSpinBox(); self.slice_spin2.setStyleSheet(SPIN_STYLE)
+        self.slice_spin2.setRange(1, 1000000)
+        self.slice_spin2.valueChanged.connect(self._update_slice_label)
+        p.add_row(self.slice_avg, self.slice_spin2)
+
+        btn_send = QPushButton('Send slice → 1D')
+        btn_send.setStyleSheet(BUTTON_STYLE)
+        btn_send.clicked.connect(self.send_slice_to_1d)
+        btn_save = QPushButton('Save slice…')
+        btn_save.setStyleSheet(BUTTON_STYLE)
+        btn_save.clicked.connect(self.save_slice)
+        btn_send.setFixedHeight(btn_save.sizeHint().height())
+        p.add_button_row(btn_send, btn_save, width=gf.ACTION_W)
+        p.add_stretch()
+        return p
+
+    def _build_reshape_tab(self):
+        p = gf.FormPanel(field_width=gf.FIELD_W,
+                         button_width=gf.BTN_W)
+        p.add_title('Integrate traces and reshape into a 2D map', help=_HELP_RESHAPE)
+        self.reshape_from = self._dspin(-1e12, 1e12, 3, 0.0)
+        self.reshape_to = self._dspin(-1e12, 1e12, 3, 0.0)
+        p.add_row('X window from / to', self.reshape_from, self.reshape_to,
+                  tooltip='In X-axis units; From = To integrates the whole trace.')
+        self.reshape_n1 = QSpinBox(); self.reshape_n1.setStyleSheet(SPIN_STYLE)
+        self.reshape_n1.setRange(2, 1000000)
+        self.reshape_n1.setValue(64)
+        p.add_row('Fast points N₁', self.reshape_n1,
+                  tooltip='Traces per row of the map (the fast delay); N₂ = traces / N₁.')
+        for w in (self.reshape_from, self.reshape_to, self.reshape_n1):
+            w.valueChanged.connect(self._live_update)
+        self.reshape_axes = []
+        for tag, name in (('X', 't1'), ('Y', 't2')):
+            nedit = QLineEdit(name); nedit.setStyleSheet(LINEEDIT_STYLE)
+            uedit = QLineEdit('ns'); uedit.setStyleSheet(LINEEDIT_STYLE)
+            p.add_row(f'New {tag}', nedit, uedit, stretch=[2, 1])
+            start, step = self._dspin(-1e12, 1e12, 3, 0.0), self._dspin(-1e12, 1e12, 3, 1.0)
+            p.add_row(f'New {tag} start / step', start, step)
+            self.reshape_axes.append((nedit, uedit, start, step))
+        btn = QPushButton('Reshape')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_reshape)
+        p.add_button_row(btn, width=gf.ACTION_W)
+        p.add_stretch()
+        return p
+
+    def _build_background_tab(self):
+        p = gf.FormPanel(field_width=gf.FIELD_W,
+                         button_width=gf.BTN_W)
+        p.add_title('Subtract a fitted background from each trace', help=_HELP_BACKGROUND)
+        self.bg_axis = self._combo(['X (within trace)', 'Y (indirect)', 'Both (X then Y)'])
+        p.add_row('Axis', self.bg_axis)
+        self.bg_model = self._combo(['Polynomial', 'Exponential'])
+        p.add_row('Model', self.bg_model)
+        self.bg_order_label = self._label('Order')
+        self.bg_order = QSpinBox(); self.bg_order.setStyleSheet(SPIN_STYLE)
+        self.bg_order.setRange(0, 5)
+        self.bg_order.setValue(3)
+        p.add_row(self.bg_order_label, self.bg_order)
+        self.bg_model.currentIndexChanged.connect(self._update_bg_model)
+        for w in (self.bg_axis, self.bg_model):
+            w.currentIndexChanged.connect(self._live_update)
+        self.bg_order.valueChanged.connect(self._live_update)
+        btn = QPushButton('Subtract')
+        btn.setStyleSheet(BUTTON_STYLE)
+        btn.clicked.connect(self.do_background)
+        p.add_button_row(btn, width=gf.ACTION_W)
+        p.add_stretch()
+        return p
+
+    def _update_bg_model(self, *args):
+        poly = self.bg_model.currentIndex() == 0
+        self.bg_order_label.setVisible(poly)
+        self.bg_order.setVisible(poly)
+
+    def _prefill_reshape(self, lines):
+        """Restore map geometry and integration window from experiment headers."""
+        self._reshape_axis_values = (None, None)
+        for _, _, start, step in self.reshape_axes:
+            start.setEnabled(True); step.setEnabled(True)
+        vals = {}
+        for ln in lines:
+            key, sep, val = str(ln).lstrip('# ').partition(':')
+            nums = re.findall(r'[-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?', val)
+            if sep and nums:
+                vals[key.strip().lower()] = [float(v) for v in nums]
+        if all(k in vals for k in ('delay / field points', 'sweep axis (ns)', 'start field', 'field step')):
+            n1 = int(vals['delay / field points'][0])
+            delays = vals['sweep axis (ns)']
+            if len(delays) != n1:
+                return
+            hx = self._axis_spec('Delay / length', unit='ns')
+            self._axis_from_array(hx, delays, 'ns')
+            hy = self._axis_spec('Field', vals['start field'][0], vals['field step'][0], 'G')
+        elif all(k in vals for k in ('n1', 't start', 'tau start', 't step', 'tau step')):
+            n1 = int(vals['n1'][0])
+            hx, hy = (self._axis_spec(name, vals[f'{name.lower()} start'][0],
+                                     vals[f'{name.lower()} step'][0], 'ns')
+                      for name in ('T', 'tau'))
+        elif all(k in vals for k in ('n1', 't1 start', 't2 start', 't1 / t2 step')):
+            n1 = int(vals['n1'][0])
+            hx, hy = (self._axis_spec(name, vals[f'{name} start'][0], vals['t1 / t2 step'][0], 'ns')
+                      for name in ('t1', 't2'))
+        else:
+            return
+        self.reshape_n1.setValue(n1)
+        self._reshape_axis_values = (hx.get('values'), hy.get('values'))
+        for (nedit, uedit, start, step), ax in zip(self.reshape_axes, (hx, hy)):
+            nedit.setText(ax['name']); uedit.setText(ax['unit'])
+            start.setValue(ax['start']); step.setValue(ax['step'])
+            uniform = ax.get('values') is None
+            start.setEnabled(uniform); step.setEnabled(uniform)
+            tip = '' if uniform else 'Exact nonuniform delays from the file; displayed by point index.'
+            start.setToolTip(tip); step.setToolTip(tip)
+        win = vals.get('integration window', [])
+        if len(win) == 2:
+            try:
+                factor = float(fft_module.time_axis_ns(1, self.src_col['scale']))
+            except (ValueError, TypeError):
+                return
+            self.reshape_from.setValue(win[0]/factor); self.reshape_to.setValue(win[1]/factor)
+
+    def _fit_fixed(self, model):
+        """{'beta': value} when Fix β is on and the model has β, else None."""
+        if (self.fit_fix_beta.isChecked()
+                and 'beta' in self.fitter.param_names(model)):
+            return {'beta': self.fit_beta.value()}
+        return None
+
+    def _update_fit_params(self, *args):
+        """Repopulate the map-parameter combo from the current model, honouring
+        the fix-offset checkbox (which drops the b/c baseline term)."""
+        model = RELAX_MODELS[self.fit_model.currentIndex()]
+        formula = self.fitter.model_formula(model)
+        self.fit_formula.setText(
+            f'<span style="color: rgb(160, 160, 190);">{formula}</span>'
+            if formula else '')
+        names = list(self.fitter.param_names(model))
+        has_beta = 'beta' in names
+        self.fit_fix_beta.setEnabled(has_beta)
+        self.fit_beta.setEnabled(has_beta)
+        if self.fit_no_offset.isChecked():
+            names = [n for n in names if n not in ('b', 'c')]
+        if self._fit_fixed(model):
+            names.remove('beta')
+        cur = self.fit_param.currentText()
+        self.fit_param.blockSignals(True)
+        self.fit_param.clear(); self.fit_param.addItems(names)
+        default = next((n for n in names if n.startswith('k') or n == 'Tm'),
+                       names[0] if names else '')
+        self.fit_param.setCurrentText(cur if cur in names else default)
+        self.fit_param.blockSignals(False)
+
+    # ------------------------------------------------------- file dialogs
+    def _remember_dir(self, path):
+        """Record the folder of `path` as the next dialog's starting directory."""
+        self.last_dir = os.path.dirname(path) or self.last_dir
+        _save_last_dir(self.last_dir)
+
+    def _open_dialog(self, **kw):
+        path = self.opener.open_file_dialog(multiprocessing=True,
+                                            directory=self.last_dir, **kw)
+        if path and path != 'None':
+            self._remember_dir(path)
+        return path
+
+    def _save_dialog(self, name_filters=DATA_SAVE_FILTERS):
+        path = self.opener.FileDialog(directory=self.last_dir, mode='Save',
+                                      name_filters=name_filters)
+        if not path:
+            return None
+        exts = [e for f in name_filters for e in re.findall(r'\*(\.\w+)', f)]
+        if not path.lower().endswith(tuple(exts)):
+            path += re.search(r'\*(\.\w+)', self.opener.dialog.selectedNameFilter()).group(1)
+        self.opener.save_cancelled = False
+        self._remember_dir(path)
+        return path
+
+    # ------------------------------------------------------------- loading
+    def open_iq(self):
+        path = self._open_dialog(name_filters=['Data (*.csv *.h5)', 'All files (*)'])
+        if not path or path == 'None':
+            return
+        try:
+            xarr = yarr = None
+            xaunit = yaunit = None
+            if str(path).endswith('.h5'):
+                # one file holds both quadratures; the axes come as datasets
+                arr = self.opener.open_2d(path)[1]
+                if np.ndim(arr) == 3:
+                    i = np.atleast_2d(np.asarray(arr[0], dtype=float))
+                    q = np.atleast_2d(np.asarray(arr[1], dtype=float))
+                    qmsg = 'Q dataset'
+                else:
+                    i = np.atleast_2d(np.asarray(arr, dtype=float))
+                    q = np.zeros_like(i)
+                    qmsg = 'no Q dataset (Q = 0)'
+                axes = self.opener.open_h5_axes(path)
+                xarr, yarr = axes.get('t'), axes.get('sweep')
+                units = self.opener.open_h5_axis_units(path)
+                xaunit, yaunit = units.get('t'), units.get('sweep')
+            else:
+                i = np.atleast_2d(np.genfromtxt(path, delimiter=','))
+                base = path[:-4] if path.lower().endswith('.csv') else path
+                qpath = base + '_1.csv'
+                if os.path.isfile(qpath):
+                    q = np.atleast_2d(np.genfromtxt(qpath, delimiter=','))
+                    qmsg = os.path.basename(qpath)
+                else:
+                    q = np.zeros_like(i)
+                    qmsg = 'no _1 file (Q = 0)'
+            header_lines = read_header(path)    # one read: axis steps + viewer
+            hx, hy = self._parse_axis_header(header_lines)
+            for spec, arr, unit, size in ((hx, xarr, xaunit, i.shape[1]),
+                                         (hy, yarr, yaunit, i.shape[0])):
+                if unit is not None or spec['step'] is None:
+                    self._axis_from_array(spec, arr, unit)
+                if spec.get('values') is not None and len(spec['values']) != size:
+                    raise ValueError('Axis length does not match the data matrix.')
+            for spec, default in ((hx, 'Time'), (hy, 'Delay')):
+                if spec['step'] is not None and spec['name'] is None:
+                    spec['name'] = default
+            if i.shape != q.shape or min(i.shape) < 2:
+                self.set_status('I and Q must be matching 2D matrices (≥ 2×2).')
+                return
+            self._src_file = {'i': i, 'q': q, 'x': hx, 'y': hy}
+            self.live_check.setChecked(False)   # new data: don't auto-reprocess
+            offres, parsed = self._rebuild_from_source()
+            self._set_loaded_file(os.path.basename(path))
+            self._set_header(os.path.basename(path), header_lines)
+            msg = (f'Loaded I={os.path.basename(path)}, Q={qmsg} '
+                   f'(matrix {self.raw_i.shape[0]}×{self.raw_i.shape[1]} [traces × points]'
+                   f'{", off-resonance reference removed" if offres else ""}).')
+            if parsed:
+                msg += f' Axes from file: {parsed}.'
+            shift = header_frequency_shift(header_lines)
+            if shift:
+                msg += (f' Frequency shift {shift:g} MHz set from the file header — '
+                        f'Phase tab → Apply correction to demodulate.')
+            self.set_status(msg)
+        except Exception as e:
+            self.set_status(f'Could not read I/Q: {e}')
+
+    @staticmethod
+    def _axis_start_step(arr):
+        """(start, step) for a 1D abscissa; step is the average increment."""
+        a = np.asarray(arr, dtype=float)
+        if a.size < 2:
+            return (float(a[0]) if a.size else 0.0), 1.0
+        return float(a[0]), float((a[-1] - a[0])/(a.size - 1))
+
+    @staticmethod
+    def _axis_spec(name=None, start=None, step=None, unit=None):
+        return {'name': name, 'start': start, 'step': step, 'unit': unit}
+
+    # header label → (axis, field, axis name it implies)
+    _HEADER_AXIS_KEYS = (('horizontal resolution', 'x', 'step', None),
+                         ('vertical resolution', 'y', 'step', None),
+                         ('time resolution', 'x', 'step', 'Time'),
+                         ('start field', 'y', 'start', 'Field'),
+                         ('field step', 'y', 'step', 'Field'))
+
+    @classmethod
+    def _parse_axis_header(cls, header_lines):
+        """Axis specs (name / start / step / unit, None when absent) scanned
+        from an already-read comment header (header_view.read_header).
+
+        Pulsed files carry ``Horizontal Resolution: 2 ns`` and ``Vertical
+        Resolution: 1004.8 ns`` (Horizontal → X, within-trace / columns;
+        Vertical → Y, traces / rows). TR EPR files carry ``Time Resolution``,
+        ``Start Field`` and ``Field Step``, which also name the axes Time and
+        Field. A field the header does not give stays None, so the matching
+        widget is left untouched; the caller names a nameless axis by default.
+        """
+        spec = {'x': cls._axis_spec(), 'y': cls._axis_spec()}
+        for ln in header_lines:
+            m = re.match(r'\s*#?\s*([XY])\s*\((.*)\)\s*:\s*values\s+(\[.*\])\s*$', ln)
+            if m:
+                name, sep, unit = m.group(2).rpartition('/')
+                if not sep:
+                    name, unit = unit, ''
+                ax = spec[m.group(1).lower()]
+                ax.update(name=name, unit=unit)
+                cls._axis_from_array(ax, ast.literal_eval(m.group(3)), unit)
+                continue
+            # 'X (Name/unit): start a step b', as save_result writes it
+            m = re.match(r'\s*#?\s*([XY])\s*\((.*)\)\s*:\s*start\s+(\S+)\s+step\s+(\S+)', ln)
+            if m:
+                name, sep, unit = m.group(2).rpartition('/')
+                if not sep:
+                    name, unit = unit, ''
+                try:
+                    start, step = float(m.group(3)), float(m.group(4))
+                except ValueError:
+                    continue
+                if unit == 's':
+                    start, step, unit = start * 1e9, step * 1e9, 'ns'
+                spec[m.group(1).lower()].update(name=name, unit=unit,
+                                                start=start, step=step, values=None)
+                continue
+            m = re.match(r'\s*#?\s*([a-z\- ]+?)\s*:\s*([-+0-9.eE]+)\s*([a-zA-Zµ%]*)',
+                         ln, re.IGNORECASE)
+            if not m:
+                continue
+            key = m.group(1).strip().lower()
+            for label, ax, field, name in cls._HEADER_AXIS_KEYS:
+                if key != label:
+                    continue
+                try:
+                    val = float(m.group(2))
+                except ValueError:
+                    break
+                unit = m.group(3) or None
+                if unit == 's':
+                    val, unit = val * 1e9, 'ns'
+                spec[ax][field] = val
+                if unit:
+                    spec[ax]['unit'] = unit
+                if name:
+                    spec[ax]['name'] = name
+                break
+        return spec['x'], spec['y']
+
+    @staticmethod
+    def _axis_from_array(spec, arr, unit=None):
+        """Keep nonuniform coordinates intact; uniform axes retain start/step."""
+        if arr is None:
+            return
+        arr = np.asarray(arr, float)
+        if arr.ndim != 1 or not arr.size or not np.isfinite(arr).all():
+            raise ValueError('Axis must be a finite, nonempty coordinate vector.')
+        if unit == 's':
+            arr, unit = arr * 1e9, 'ns'
+        if unit is not None:
+            spec['unit'] = unit
+        start, step = MainWindow._axis_start_step(arr)
+        diff = np.diff(arr)
+        if diff.size and not (np.all(diff > 0) or np.all(diff < 0)):
+            raise ValueError('Axis coordinates must be strictly increasing or decreasing.')
+        uniform = np.allclose(diff, step, rtol=1e-7, atol=abs(step)*1e-9)
+        spec.update(start=start, step=step if uniform else 0.0,
+                    values=None if uniform else arr.copy())
+
+    def _apply_axis_specs(self, hx, hy):
+        """Push two axis specs into the Axes widgets without firing the
+        live-update loops. A step without a start runs from 0 (a resolution-
+        based axis); a None field leaves its widget untouched. Returns a short
+        summary of what was filled, or '' when nothing was."""
+        done = []
+        pairs = [('X', hx, self.xname_edit, self.xscale_edit, self.x0_spin, self.dx_spin),
+                 ('Y', hy, self.yname_edit, self.yscale_edit, self.y0_spin, self.dy_spin)]
+        for label, spec, nedit, uedit, zspin, dspin in pairs:
+            start, step = spec['start'], spec['step']
+            uniform = spec.get('values') is None
+            zspin.setEnabled(uniform); dspin.setEnabled(uniform)
+            tip = '' if uniform else 'Exact nonuniform coordinates from the file; displayed by point index.'
+            zspin.setToolTip(tip); dspin.setToolTip(tip)
+            if step is not None and start is None:
+                start = 0.0
+            for w, v in ((nedit, spec['name']), (uedit, spec['unit'])):
+                if v is not None:
+                    w.blockSignals(True); w.setText(str(v)); w.blockSignals(False)
+            for w, v in ((zspin, start), (dspin, step)):
+                if v is not None:
+                    w.blockSignals(True)
+                    decimals = max(3, 6 - int(np.floor(np.log10(abs(v))))) if v else 3
+                    try:
+                        factor = float(fft_module.time_axis_ns(1, uedit.text()))
+                    except ValueError:
+                        pass
+                    else:
+                        decimals = max(decimals, 3 + int(np.log10(factor)))
+                    w.setDecimals(min(15, decimals))
+                    w.setValue(float(v))
+                    w.blockSignals(False)
+            if not uniform:
+                done.append(f'{label}: {len(spec["values"])} nonuniform points ({spec["unit"] or ""}); preview by index')
+            elif step is not None:
+                done.append(f'{label} start={start:g} Δ={step:g} {spec["unit"] or ""}'.strip())
+        return ', '.join(done)
+
+    def _rebuild_from_source(self):
+        """Derive the raw matrices from the as-read source under the current
+        Source options (off-resonance removal, transpose), refill the Axes
+        widgets and restart the chain from raw. Returns (offres, axes summary)."""
+        src = self._src_file
+        i, q, hx, hy = src['i'], src['q'], dict(src['x']), dict(src['y'])
+        offres = self.tr_epr_check.isChecked() and i.shape[0] > 2
+        if offres:
+            # same two-step subtraction as tr_control / Open TR Data: reference row, then time-zero column
+            i, q = (i - i[0])[1:], (q - q[0])[1:]
+            i, q = i - i[:, [0]], q - q[:, [0]]
+            if hy.get('values') is not None:
+                hy['values'] = hy['values'][1:]
+                hy['start'] = float(hy['values'][0])
+        if self.transpose_check.isChecked():
+            i, q = i.T, q.T
+            hx, hy = hy, hx                     # axes swap with the matrix
+        self.raw_i, self.raw_q = i, q
+        self._raw_axis_values = (hx.get('values'), hy.get('values'))
+        parsed = self._apply_axis_specs(hx, hy)
+        self.reset_to_raw()
+        return offres, parsed
+
+    def _on_source_option(self, *args):
+        if self._src_file is None:
+            return
+        offres, _ = self._rebuild_from_source()
+        self.set_status(f'Source re-read ({self.raw_i.shape[0]}×{self.raw_i.shape[1]} '
+                        f'[traces × points]'
+                        f'{", off-resonance reference removed" if offres else ""}'
+                        f'{", transposed" if self.transpose_check.isChecked() else ""}).')
+
+    def open_bruker(self):
+        """Load a 2D Bruker native dataset (BES3T .DSC/.DTA or ESP/WinEPR
+        .par/.spc). Rows = traces (Y/indirect), cols = points (X/within trace);
+        complex data fills I & Q, real data sets Q = 0. The axis fields are
+        populated from the descriptor."""
+        nf = ['Bruker (*.DSC *.dsc *.DTA *.dta *.par *.spc *.PAR *.SPC)',
+              'BES3T (*.DSC *.dsc *.DTA *.dta)',
+              'ESP/WinEPR (*.par *.spc *.PAR *.SPC)', 'All files (*)']
+        path = self._open_dialog(name_filters=nf)
+        if not path or path == 'None':
+            return
+        try:
+            res = self.bruker.open(path)
+        except Exception as e:
+            self.set_status(f'Could not read Bruker file: {e}')
+            return
+        if res['ndim'] != 2:
+            self.set_status(f'{res["format"]} {res["ndim"]}D dataset — the 2D tool '
+                            f'needs a 2D matrix; use the 1D Data Treatment window.')
+            return
+        data = np.asarray(res['data'])               # (ny traces, nx points)
+        i = np.real(data).astype(float)
+        q = np.imag(data).astype(float) if res['complex'] else np.zeros_like(i)
+        # X = within-trace (cols), Y = indirect (rows); transpose swaps them
+        xarr, yarr = res['x'], res['y']
+        xn, xs = res['x_name'] or 'X', res['x_unit'] or ''
+        yn, ys = res['y_name'] or 'Y', res['y_unit'] or ''
+        if min(i.shape) < 2:
+            self.set_status('Bruker matrix too small (need ≥ 2×2).')
+            return
+        x0, dx = self._axis_start_step(xarr)
+        y0, dy = self._axis_start_step(yarr)
+        self._src_file = {'i': i, 'q': q, 'x': self._axis_spec(xn, x0, dx, xs),
+                          'y': self._axis_spec(yn, y0, dy, ys)}
+        self.live_check.setChecked(False)   # new data: don't auto-reprocess
+        self._rebuild_from_source()
+        self._set_loaded_file(os.path.basename(path))
+        self._set_header(os.path.basename(path),
+                         params_to_lines(res.get('params', {})))
+        self.set_status(f'Loaded {os.path.basename(path)} — {res["format"]}, '
+                        f'{i.shape[0]}×{i.shape[1]} [traces × points], '
+                        + ('complex.' if res['complex'] else 'real (Q = 0).'))
+
+    def load_from_plot(self, silent=False):
+        """Load a 2D image sent from the main GUI (right-click a 2D plot →
+        "Send to Data Treatment"), which writes treatment_buffer_2d.npz:
+        i/q [trace, point] matrices + axis geometry/labels. The buffer is a
+        one-shot mailbox — consumed on read."""
+        if not os.path.isfile(BUFFER_2D_PATH):
+            if not silent:
+                self.set_status('No 2D plot buffer found. Right-click a 2D plot in '
+                                'the main window → "Send to Data Treatment" first.')
+            return
+        try:
+            with np.load(BUFFER_2D_PATH, allow_pickle=False) as d:
+                i = np.atleast_2d(np.asarray(d['i'], dtype=float))
+                q = np.atleast_2d(np.asarray(d['q'], dtype=float))
+                geom = np.asarray(d['geom'], dtype=float).ravel().tolist()
+                labels = [str(s) for s in np.asarray(d['labels']).ravel().tolist()]
+            self._consume_2d_buffer()
+            if i.shape != q.shape or min(i.shape) < 2:
+                if not silent:
+                    self.set_status('2D buffer is not a valid matrix (need ≥ 2×2).')
+                return
+            x0, dx, y0, dy = (geom + [0.0, 1.0, 0.0, 1.0])[:4]
+            xn, xs, yn, ys = (labels + ['X', '', 'Y', ''])[:4]
+            # A 0 (or non-finite) step collapses the image scale → a blank plot.
+            # The main-window plot doesn't always carry a real step, so fall back
+            # to 1; the user can type the true step into the Axes fields after.
+            zeroed = []
+            if not np.isfinite(dx) or dx == 0:
+                dx = 1.0; zeroed.append('X')
+            if not np.isfinite(dy) or dy == 0:
+                dy = 1.0; zeroed.append('Y')
+            self._src_file = {'i': i, 'q': q, 'x': self._axis_spec(xn, x0, dx, xs),
+                              'y': self._axis_spec(yn, y0, dy, ys)}
+            self.live_check.setChecked(False)   # new data: don't auto-reprocess
+            self._rebuild_from_source()
+            self._set_loaded_file('Loaded from plot')
+            self._set_header('Loaded from plot', [])
+            msg = (f'Loaded 2D plot from buffer '
+                   f'({i.shape[0]}×{i.shape[1]} [traces × points]).')
+            if zeroed:
+                msg += (f' No {"/".join(zeroed)} step in the plot — set to 1; '
+                        f'adjust in the Axes fields.')
+            self.set_status(msg)
+        except Exception as e:
+            self._consume_2d_buffer()                # drop a malformed buffer
+            if not silent:
+                self.set_status(f'Could not read 2D plot buffer: {e}')
+
+    def _consume_2d_buffer(self):
+        """Delete the 2D plot buffer once read (one-shot mailbox semantics)."""
+        try:
+            if os.path.isfile(BUFFER_2D_PATH):
+                os.remove(BUFFER_2D_PATH)
+        except OSError:
+            pass
+
+    def _raw_axes(self):
+        return (self._axis(self.x0_spin.value(), self.dx_spin.value(),
+                           self.xname_edit.text(), self.xscale_edit.text(), values=self._raw_axis_values[0]),
+                self._axis(self.y0_spin.value(), self.dy_spin.value(),
+                           self.yname_edit.text(), self.yscale_edit.text(), values=self._raw_axis_values[1]))
+
+    def on_axes_changed(self, *args):
+        if self.raw_i is None:
+            return
+        # start / step edits redefine the raw geometry; restart the chain from raw
+        self.reset_to_raw()
+
+    def _relabel_axis(self, ax, name, scale):
+        """Update an axis dict's title/unit in place, unless it is operation-owned
+        (e.g. an FFT frequency axis)."""
+        if ax is not None and not ax.get('auto'):
+            ax['name'] = name
+            ax['scale'] = scale
+
+    def on_axis_labels_changed(self, *args):
+        """Title / unit edit: relabel the current plot in place (X field -> the
+        within-trace/col axis, Y field -> the indirect/row axis) without dropping
+        the result; frequency axes created by an FFT keep their auto label."""
+        if self.raw_i is None:
+            return
+        xn, xs = self.xname_edit.text(), self.xscale_edit.text()
+        yn, ys = self.yname_edit.text(), self.yscale_edit.text()
+        for unit, boxes in ((xs, (self.x0_spin, self.dx_spin)),
+                            (ys, (self.y0_spin, self.dy_spin))):
+            try:
+                factor = float(fft_module.time_axis_ns(1, unit))
+            except ValueError:
+                continue
+            for box in boxes:
+                box.setDecimals(max(box.decimals(), 3 + int(np.log10(factor))))
+        self._relabel_axis(self.src_col, xn, xs)
+        self._relabel_axis(self.src_row, yn, ys)
+        self._sync_phase_mode()
+        if self.has_result():
+            self._relabel_axis(self.res_col, xn, xs)
+            self._relabel_axis(self.res_row, yn, ys)
+            self._push(self.res_i, self.res_q, self.res_col, self.res_row,
+                       self.res_frames)
+        else:
+            self._push(self.src_i, self.src_q, self.src_col, self.src_row,
+                       ('I', 'Q'))
+
+    # ---------------------------------------------------------- live update
+    def _live_update(self, *args):
+        if self._suppress_live or not self.live_check.isChecked() or self.src_i is None:
+            return
+        # Fit (index 4) is excluded — per-trace fitting is too heavy to run on
+        # every parameter tweak; it is explicit ("Run fit") only.
+        op = {0: self.do_phase, 1: self.do_fft, 2: self.do_filter,
+              3: self.do_shear, 6: self.do_reshape,
+              7: self.do_background}.get(self.tabs.currentIndex())
+        if op is not None:
+            op()
+
+    def _apply_current_op(self):
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return
+        op = {0: self.do_phase, 1: self.do_fft, 2: self.do_filter,
+              3: self.do_shear, 4: self.do_fit_2d,
+              6: self.do_reshape, 7: self.do_background}.get(self.tabs.currentIndex())
+        if op is not None:
+            op()
+        else:
+            self.set_status('Slice tab: use "Send slice → 1D".')
+
+    # ------------------------------------------------------------- result
+    def has_result(self):
+        return self.res_i is not None
+
+    def _set_result(self, i, q, col, row, frames, meta):
+        self.res_i, self.res_q = np.asarray(i, float), np.asarray(q, float)
+        self.res_col, self.res_row = col, row
+        self.res_frames = frames
+        self.res_meta = list(meta)
+        self._push(self.res_i, self.res_q, col, row, frames)
+        self._update_slice_label()
+
+    def reset_to_raw(self):
+        if self.raw_i is None:
+            return
+        self.src_i, self.src_q = self.raw_i.copy(), self.raw_q.copy()
+        self.src_col, self.src_row = self._raw_axes()
+        self.res_i = self.res_q = None
+        self._sync_phase_mode()
+        # newly loaded data / deliberate reset => re-fit the view even when the
+        # geometry is unchanged (the dock only auto-ranges on first render or a
+        # geometry change, so force it here, mirroring the 1D tool).
+        self.cross_dock.first_render = True
+        self._push(self.src_i, self.src_q, self.src_col, self.src_row, ('I', 'Q'))
+        self._update_slice_label()
+        self.set_status('Showing raw I/Q.')
+
+    def promote_result(self):
+        if not self.has_result():
+            self.set_status('No result to chain — apply an operation first.')
+            return
+        self.src_i, self.src_q = self.res_i.copy(), self.res_q.copy()
+        self.src_col, self.src_row = self.res_col, self.res_row
+        self.res_i = self.res_q = None
+        prev = self._suppress_live       # restore, not clear: auto_shear nests this
+        self._suppress_live = True
+        try:
+            self._sync_phase_mode()
+            self._push(self.src_i, self.src_q, self.src_col, self.src_row,
+                       ('Re', 'Im'))
+        finally:
+            self._suppress_live = prev
+        self.set_status('Result registered as the new input; apply the next op.')
+
+    def clear_all(self):
+        self.raw_i = self.raw_q = self.src_i = self.src_q = None
+        self._src_file = None
+        self._raw_axis_values = (None, None)
+        self.res_i = self.res_q = None
+        self._clear_preview()
+        self._set_loaded_file(None)
+        self._set_header('', [])
+        self.set_status('Cleared. Open an I/Q 2D dataset.')
+
+    # ------------------------------------------------------- header viewer
+    def _set_header(self, name, lines):
+        """Store the parameter header of the dataset just loaded and refresh the
+        viewer. A load never opens the window — only the 'Header…' button does."""
+        self.header_name, self.header_lines = name, list(lines or [])
+        shift = header_frequency_shift(self.header_lines)
+        prev = self._suppress_live
+        self._suppress_live = True
+        try:
+            self.phase_first.setValue(0.0 if shift is None else shift)
+            self._prefill_reshape(self.header_lines)
+        finally:
+            self._suppress_live = prev
+        if self.header_window is not None:
+            self.header_window.set_sources([(self.header_name or 'dataset',
+                                             self.header_lines)])
+
+    def show_header(self):
+        """'Header…' button: open (or raise) the viewer on the loaded dataset."""
+        if self.header_window is None:
+            self.header_window = HeaderWindow(self)
+        self.header_window.set_sources([(self.header_name or 'dataset',
+                                         self.header_lines)])
+        if not self.header_lines:
+            self.set_status('The loaded dataset carries no parameter header.')
+        self.header_window.show_source()
+
+    def _clear_preview(self):
+        """Wipe the embedded heatmap + X/Y cross-section traces and reset the
+        dock's render state so the next load re-autoranges from scratch."""
+        cd = self.cross_dock
+        try:
+            # close the floating X-trace / Y-trace cross-section docks if open
+            # (Clear should leave no stale section plots behind).
+            if getattr(cd, 'cross_section_enabled', False):
+                cd.hide_cross_section()
+        except Exception:
+            pass
+        try:
+            cd.img_view.clear()
+            cd.h_cross_section_widget_data.setData([], [])
+            cd.v_cross_section_widget_data.setData([], [])
+            cd.first_render = True
+            cd.set_image = 0
+            cd.setTitle('')
+        except Exception:
+            pass
+
+    def _disable_si_prefix(self):
+        """Initial state: turn off pyqtgraph's automatic SI-prefixing on this
+        tool's preview axes (before any data is loaded). Per push, _apply_si_prefix
+        re-enables it only for bare SI-base axes.
+
+        Scoped to *this* tool's CrossSectionDock instance (own QProcess): the
+        shared widget keeps auto-prefixing for the main GUI, which depends on it."""
+        cd = self.cross_dock
+        plots = (cd.plot_item,
+                 cd.h_cross_section_widget.plotItem,
+                 cd.v_cross_section_widget.plotItem)
+        for p in plots:
+            for side in ('bottom', 'left'):
+                try:
+                    p.getAxis(side).enableAutoSIPrefix(False)
+                except Exception:
+                    pass
+
+    def _apply_si_prefix(self, xunit, yunit, zunit):
+        """Auto-SI-prefix only the axes whose unit is a bare SI base, so a 's'
+        axis with a 2e-9 step reads '2 ns' (_push rescales a prefixed unit to
+        its base first); a non-SI label stays verbatim. X is the heatmap bottom
+        + the X-trace bottom; Y is the heatmap left + the Y-trace bottom; Z
+        (intensity) is both cross-section left axes."""
+        cd = self.cross_dock
+        x_on, y_on, z_on = (_si_autoprefix(xunit), _si_autoprefix(yunit),
+                            _si_autoprefix(zunit))
+        axes = [(cd.plot_item, 'bottom', x_on),
+                (cd.plot_item, 'left', y_on),
+                (cd.h_cross_section_widget.plotItem, 'bottom', x_on),
+                (cd.h_cross_section_widget.plotItem, 'left', z_on),
+                (cd.v_cross_section_widget.plotItem, 'bottom', y_on),
+                (cd.v_cross_section_widget.plotItem, 'left', z_on)]
+        for p, side, on in axes:
+            try:
+                _set_autoprefix(p.getAxis(side), on)
+            except Exception:
+                pass
+
+    # --------------------------------------------------------------- push
+    def _push_current(self, *args):
+        if self.has_result():
+            self._push(self.res_i, self.res_q, self.res_col, self.res_row,
+                       self.res_frames)
+        elif self.src_i is not None:
+            self._push(self.src_i, self.src_q, self.src_col, self.src_row,
+                       ('I', 'Q'))
+
+    def _push(self, i, q, col, row, frames):
+        """Render a complex 2D dataset in the embedded CrossSectionDock as a
+        (2, nX, nY) frame stack (frame 0 = real/I, frame 1 = imag/Q); the frame
+        slider toggles between them. A real-only dataset is a single frame."""
+        name = self.name_edit.text().strip() or 'FT Data 2D'
+        # internal layout is [trace(row), point(col)]; transpose so columns
+        # become the X axis (CrossSectionDock pos/scale are ((x..),(y..))).
+        re_, im_ = np.transpose(np.asarray(i, float)), np.transpose(np.asarray(q, float))
+        # a real-only dataset (Q ≡ 0) is one frame: no empty Q frame, no frame strip
+        arr = np.array([re_, im_]) if np.any(im_) else re_
+        col, row = (self._axis(0, 1, ax['name'] + ' point', '') if ax.get('values') is not None else ax
+                    for ax in (col, row))
+        # a 0 step collapses the image scale and renders nothing; never let that
+        # reach setImage (axis geometry may carry a 0 from a source without steps).
+        sx = col['step'] if col['step'] else 1.0
+        sy = row['step'] if row['step'] else 1.0
+        # a prefixed unit (ns, MHz) is drawn in its SI base so ticks, cursor and
+        # ruler auto-prefix correctly (50 µs, not 50 kns); the Axes fields keep ns
+        fx, xunit = _si_base(col['scale'])
+        fy, yunit = _si_base(row['scale'])
+        try:
+            self.cross_dock.setTitle(name)
+            self.cross_dock.setAxisLabels(xname=col['name'], xscale=xunit,
+                                          yname=row['name'], yscale=yunit,
+                                          zname='Intensity', zscale='V')
+            self._apply_si_prefix(xunit, yunit, 'V')
+            self.cross_dock.setImage(arr, pos=(col['start']*fx, row['start']*fy),
+                                     scale=(sx*fx, sy*fy), autoLevels=False)
+        except Exception as e:
+            self.set_status(f'Could not render preview: {e}')
+
+    def set_status(self, text):
+        self.status.setText(text)
+        general.message(text)
+
+    def _set_loaded_file(self, name):
+        """Show the source of the current dataset under the Source buttons."""
+        self.loaded_label.setText(f'File: {name}' if name else 'File: —')
+
+    # ---------------------------------------------------------- operations
+    @staticmethod
+    def _is_freq_axis(ax):
+        """True if an axis dict already describes a frequency axis — i.e. the
+        input has been FFT'd (e.g. via 'Result → input'). Lets auto-φ₀ tell a
+        spectrum from a time-domain FID so it doesn't transform twice."""
+        if not ax:
+            return False
+        name = str(ax.get('name', '')).lower()
+        unit = str(ax.get('scale', '')).strip().lower()
+        return ('freq' in name) or (unit in ('hz', 'khz', 'mhz', 'ghz', 'thz'))
+
+    def _phase_time_axis(self):
+        if self._is_freq_axis(self.src_col):
+            raise ValueError('Use frequency-domain phase correction for spectral input.')
+        x = self._axis_values(self.src_col, self.src_i.shape[1])
+        return fft_module.time_axis_ns(x, self.src_col['scale'])
+
+    def _phase_spectrum(self):
+        """Return the existing spectrum with its phase coordinates in MHz."""
+        z = self.src_i + 1j*self.src_q
+        x = self._axis_values(self.src_col, z.shape[1])
+        try:
+            f = fft_module.frequency_axis_mhz(x, self.src_col['scale'])
+        except ValueError as exc:
+            raise ValueError('Frequency-domain mode needs a frequency axis (Hz, kHz, MHz, GHz or THz). '
+                             'For time data, use FFT → Result → input first.') from exc
+        return z, f, self.src_col
+
+    def _spectral_phase(self, f, zero=0.0):
+        df = f - self.phase_pivot.value()
+        return np.deg2rad(zero + self.phase_freq_first.value()*df
+                         + self.phase_freq_second.value()*df**2)
+
+    def auto_phase_zero(self):
+        """Estimate the constant rotation in the selected correction domain."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return False
+        try:
+            if self.phase_mode.currentIndex() == 1:
+                z, f, _ = self._phase_spectrum()
+                z *= np.exp(1j*self._spectral_phase(f))[None, :]
+                phi = fft_module.Fast_Fourier.auto_phase_zero(z.ravel())
+                self.phase_freq_zero.setValue(phi)
+                self.set_status(f'Auto zero order = {phi:.2f} deg (frequency domain).')
+                return True
+            t = self._phase_time_axis()
+            v1 = self.phase_first.value()
+            z = (self.src_i + 1j*self.src_q)*np.exp(2j*np.pi*v1*t/1000.0)[None, :]
+            phi = fft_module.Fast_Fourier.auto_phase_zero_echo(z)
+            self.phase_zero.setValue(phi)
+            dt = float(t[1] - t[0]) if len(t) > 1 and self.src_col.get('values') is None else 0.0
+            f0 = self._carrier(z, dt)*1000.0 if dt else 0.0
+            env = np.abs(z).mean(axis=0)
+            width = abs(dt)*max(1, int(np.count_nonzero(env >= 0.25*env.max())))
+            message = f'Auto constant phase = {phi:.2f} deg (time domain).'
+            if abs(f0)*width/1000.0 > 0.125:
+                message += f' Residual carrier {f0:+.3f} MHz; set Frequency shift to {v1-f0:.3f} MHz.'
+            self.set_status(message)
+            return True
+        except ValueError as e:
+            self.set_status(str(e))
+            return False
+
+    @staticmethod
+    def _carrier(Z, dt):
+        """Carrier offset of the echo, measured on a band-limited copy.
+
+        `carrier_offset` reads the phase increment between neighbouring samples,
+        which the out-of-band noise of an undemodulated record swamps: the raw
+        SIFTER map reads +0.28 MHz where the true offset is −0.46. An echo of
+        width W cannot be spectrally wider than a few times 1/W, so everything
+        beyond 10/W of the echo's spectral peak is noise and is dropped before
+        measuring; centring on the peak keeps a large raw IF offset in band."""
+        env = np.abs(Z).mean(axis=0)
+        echo = env >= 0.25*env.max()
+        width = abs(dt)*max(1, int(np.count_nonzero(echo)))
+        f = np.fft.fftfreq(Z.shape[1], dt)
+        fc = f[int(np.abs(np.fft.fft(Z*echo, axis=1)).sum(axis=0).argmax())]
+        S = np.fft.fft(Z, axis=1)
+        S[:, np.abs(f - fc) > 10.0/width] = 0
+        return fft_module.Fast_Fourier.carrier_offset(np.fft.ifft(S, axis=1), dt)
+
+    @staticmethod
+    def _imag_fraction(W):
+        """Imaginary energy left in `W` after its best zero-order rotation."""
+        W = W*np.exp(-1j*np.angle((W**2).sum())/2)
+        denom = np.abs(W).sum()
+        return float(np.abs(W.imag).sum()/denom) if denom else 1.0
+
+    def _refine_first(self, Z, tvec, v1):
+        """Grid-search the first order about `v1` for the least imaginary residue
+        over the echo region, parabolically refined.
+
+        The carrier estimate is the intensity centroid of the line, which is not
+        where the trace phases best when the line is asymmetric — on the SIFTER
+        records the centroid lands at about half the residue-optimal value. The
+        residue is what phasing is actually for, so it decides the final number."""
+        env = np.abs(Z).mean(axis=0)
+        echo = env >= 0.25*env.max()
+        Ze = Z[:, echo]
+        te = tvec[echo] - tvec[int(env.argmax())]
+        grid = v1 + np.arange(-1.0, 1.0001, 0.02)
+        res = np.array([self._imag_fraction(Ze*np.exp(2j*np.pi*g/1000.0*te)[None, :])
+                        for g in grid])
+        j = int(res.argmin())
+        best = float(grid[j])
+        if 0 < j < grid.size - 1:
+            p = np.polyfit(grid[j-1:j+2], res[j-1:j+2], 2)
+            if p[0] > 0:
+                best = float(-p[1]/(2*p[0]))
+        return best, float(res[j])
+
+    def auto_phase_first(self):
+        """Remove the time-domain carrier and refine the constant phase."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return False
+        if not self._require_uniform(self.src_col):
+            return False
+        if self.phase_mode.currentIndex() != 0:
+            self.set_status('Frequency-domain first and second orders are manual.')
+            return False
+        try:
+            t = self._phase_time_axis()
+            dt = float(t[1] - t[0]) if len(t) > 1 else 0.0
+            if dt == 0:
+                raise ValueError('Frequency-shift Auto needs non-zero time spacing.')
+        except ValueError as e:
+            self.set_status(str(e))
+            return False
+        z0 = self.src_i + 1j*self.src_q
+        v1 = v1_in = float(self.phase_first.value())
+        for _ in range(8):
+            z = z0*np.exp(2j*np.pi*v1*t/1000.0)[None, :]
+            f0 = self._carrier(z, dt)*1000.0
+            v1 -= f0
+            if abs(f0) < 1e-3:
+                break
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            v1, res = self._refine_first(z0, t, v1)
+        finally:
+            QApplication.restoreOverrideCursor()
+        prev = self._suppress_live
+        self._suppress_live = True
+        try:
+            self.phase_first.setValue(v1)
+        finally:
+            self._suppress_live = prev
+        self.auto_phase_zero()
+        self.set_status(f'Auto frequency shift = {self.phase_first.value():.3f} MHz '
+                        f'({v1-v1_in:+.3f} change), {100*res:.1f} % imaginary left; '
+                        f'constant phase = {self.phase_zero.value():.2f} deg.')
+        return True
+
+    def do_phase(self):
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return False
+        try:
+            if self.phase_mode.currentIndex() == 0:
+                t = self._phase_time_axis()
+                zero, shift = self.phase_zero.value(), self.phase_first.value()
+                z = (self.src_i + 1j*self.src_q)*np.exp(
+                    1j*(np.deg2rad(zero) + 2*np.pi*shift*t/1000.0))[None, :]
+                col = self.src_col
+                meta = ['Time-domain phase correction along X',
+                        f'constant phase = {zero:.6g} deg, frequency shift = {shift:.6g} MHz']
+            else:
+                z, f, col = self._phase_spectrum()
+                z *= np.exp(1j*self._spectral_phase(f, self.phase_freq_zero.value()))[None, :]
+                meta = ['Frequency-domain phase correction along X',
+                        f'zero order = {self.phase_freq_zero.value():.6g} deg, '
+                        f'first = {self.phase_freq_first.value():.6g} deg/MHz, '
+                        f'second = {self.phase_freq_second.value():.6g} deg/MHz^2, '
+                        f'pivot = {self.phase_pivot.value():.6g} MHz']
+        except ValueError as e:
+            self.set_status(str(e))
+            return False
+        self._set_result(z.real, z.imag, col, self.src_row, ('Re', 'Im'), meta)
+        self.set_status('Phase correction applied.')
+        return True
+
+    def do_reshape(self):
+        """Integrate every trace over the X window and fold the flat trace index
+        i2*N1 + i1 into an N2 x N1 map (i1 along the new X)."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return False
+        if not self._require_uniform(self.src_col):
+            return False
+        ny, nx = self.src_i.shape
+        n1, dx = self.reshape_n1.value(), self.src_col['step']
+        values = self._reshape_axis_values[0]
+        if values is not None and n1 != len(values):
+            self.set_status(f'Reshape: N₁ must match the {len(values)} saved delay coordinates.')
+            return False
+        lo, hi = sorted((self.reshape_from.value(), self.reshape_to.value()))
+        x = self._axis_values(self.src_col, nx)
+        tol = 1e-6*abs(dx)
+        win = np.ones(nx, bool) if lo == hi else (x >= lo - tol) & (x < hi - tol)
+        if not win.any():
+            self.set_status(f'Reshape: no X points in the window {lo:g} – {hi:g}.')
+            return False
+        if ny % n1 or ny // n1 < 2:
+            self.set_status(f'Reshape: {ny} traces do not split into at least two '
+                            f'rows of N₁ = {n1}.')
+            return False
+        v = (self.src_i[:, win] + 1j*self.src_q[:, win]).sum(axis=1)*abs(dx)
+        z = v.reshape(ny // n1, n1)
+        col, row = (self._axis(s.value(), d.value(), n.text(), u.text(), auto=True, values=values)
+                    for (n, u, s, d), values in zip(self.reshape_axes, self._reshape_axis_values))
+        meta = ['Integrate along X and reshape the trace index',
+                f'X window {x[win][0]:g} – {x[win][-1]:g} ({int(win.sum())} pts), '
+                f'sum × step {abs(dx):g}',
+                f'map {ny // n1} × {n1} (N₂ × N₁), trace = i₂·N₁ + i₁']
+        self._set_result(z.real, z.imag, col, row, ('Re', 'Im'), meta)
+        self.set_status(f'Integrated {int(win.sum())} X points; {ny} traces → '
+                        f'{ny // n1} × {n1} map (N₂ × N₁).')
+        return True
+
+    def _bg_fit(self, M, x):
+        """Least-squares background of every column of the real matrix M, whose
+        rows are the samples at x; numpy only."""
+        u = np.abs(x - x[0])
+        u = u/(u.max() or 1.0)
+        if self.bg_model.currentIndex() == 0:
+            A = np.polynomial.polynomial.polyvander(2*u - 1, self.bg_order.value())
+            return A @ np.linalg.lstsq(A, M, rcond=None)[0]
+        mm, err = (M**2).sum(axis=0), np.full(M.shape[1], np.inf)
+        tb, cb = np.ones(M.shape[1]), np.zeros((2, M.shape[1]))
+        for T in np.geomspace(0.01, 100.0, 121):
+            A = np.column_stack((np.ones_like(u), np.exp(-u/T)))
+            B = A.T @ M
+            c = np.linalg.lstsq(A.T @ A, B, rcond=None)[0]
+            e = mm - (c*B).sum(axis=0)
+            better = e < err
+            err[better], tb[better], cb[:, better] = e[better], T, c[:, better]
+        return cb[0] + cb[1]*np.exp(-u[:, None]/tb[None, :])
+
+    def do_background(self):
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return False
+        i, q = self.src_i, self.src_q
+        mode = self.bg_axis.currentIndex()
+        for axis in ((1,), (0,), (1, 0))[mode]:
+            ax = self.src_col if axis == 1 else self.src_row
+            if axis == 1:
+                i, q = i.T, q.T
+            k = i.shape[1]
+            fit = self._bg_fit(np.hstack((i, q)), self._axis_values(ax, i.shape[0]))
+            i, q = i - fit[:, :k], q - fit[:, k:]
+            if axis == 1:
+                i, q = i.T, q.T
+        where = ('X', 'Y', 'X then Y')[mode]
+        model = (f'polynomial order {self.bg_order.value()}'
+                 if self.bg_model.currentIndex() == 0 else 'exponential a + b·exp(−t/T)')
+        meta = [f'Background subtraction along {where}',
+                f'model: {model}, I and Q fitted separately per trace']
+        self._set_result(i, q, self.src_col, self.src_row, ('Re', 'Im'), meta)
+        self.set_status(f'Background subtracted ({model}, along {where}).')
+        return True
+
+    def _freq_axis(self, n, step, scale):
+        """Frequency axis + unit for an FFT of `n` points with the given sample
+        step/unit. ps/ns/us/ms → MHz; s → Hz; else 1/unit."""
+        s = scale.strip().lower()
+        if s == 's':
+            d, funit = step, 'Hz'
+        else:
+            try:
+                d = float(fft_module.time_axis_ns(step, s))*1e-3
+                funit = 'MHz'
+            except ValueError:
+                d, funit = step, f'1/{scale}'
+        if d == 0:
+            d = 1.0
+        fr = np.fft.fftshift(np.fft.fftfreq(int(n), d))
+        return fr, funit
+
+    def auto_echo_center(self):
+        """Fill 'skip pts' with the echo centre along the transform axis: the
+        peak of the |I+iQ| envelope, averaged over the other (non-transform)
+        axis so the field-offset modulation cancels."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return
+        # X for the X-only and 2D modes; Y only for the Y-only mode. The echo
+        # centre is a property of the direct (X) time axis.
+        along_x = (self.fft_axis.currentIndex() != 1)
+        axis = 1 if along_x else 0
+        mag = np.sqrt(self.src_i**2 + self.src_q**2)
+        profile = mag.mean(axis=1 - axis)   # collapse the non-transform axis
+        k = sigproc.echo_center(profile)
+        self.fft_skip.setValue(int(k))
+        self.set_status(f'Echo centre at point {k} along '
+                        f'{"X" if along_x else "Y"} (skip set).')
+
+    def do_fft(self):
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return
+        mode = self.fft_axis.currentIndex()   # 0 = X, 1 = Y, 2 = both (2D)
+        axes = (self.src_col, self.src_row) if mode == 2 else ((self.src_col,) if mode == 0 else (self.src_row,))
+        if not self._require_uniform(*axes):
+            return
+        win_name = self.fft_window.currentText()
+        wparam = (self.fft_winparam.value()
+                  if win_name in WINDOW_PARAM else 8.6)
+        zf = self.fft_zerofill.currentText()
+
+        if mode == 2:
+            # full 2D FFT: both X (columns) and Y (rows) become frequency. The
+            # echo-centre skip drops leading columns (the direct/echo X axis).
+            skip = max(0, min(int(self.fft_skip.value()), self.src_i.shape[1] - 2))
+            src_i = self.src_i[:, skip:]; src_q = self.src_q[:, skip:]
+            nrows, ncols = src_i.shape
+            win_x = sigproc.apodization_window(ncols, win_name, wparam)
+            win_y = sigproc.apodization_window(nrows, win_name, wparam)
+            Z = (src_i + 1j*src_q)*win_y[:, None]*win_x[None, :]
+            nx = sigproc.zerofill_length(ncols, zf)
+            ny = sigproc.zerofill_length(nrows, zf)
+            sp = np.fft.fftshift(np.fft.fft2(Z, s=(ny, nx)), axes=(0, 1))
+            frx, funx = self._freq_axis(nx, self.src_col['step'], self.src_col['scale'])
+            fry, funy = self._freq_axis(ny, self.src_row['step'], self.src_row['scale'])
+            dfx = float(frx[1] - frx[0]) if nx > 1 else 1.0
+            dfy = float(fry[1] - fry[0]) if ny > 1 else 1.0
+            res_col = self._axis(float(frx[0]), dfx, 'Frequency Offset', funx, auto=True)
+            res_row = self._axis(float(fry[0]), dfy, 'Frequency Offset', funy, auto=True)
+            mx, tx = self._fft_mask(frx, self.fft_x_type, self.fft_x_lo, self.fft_x_hi)
+            my, ty = self._fft_mask(fry, self.fft_y_type, self.fft_y_lo, self.fft_y_hi)
+            if mx is not None:
+                sp = sp*mx[None, :]
+            if my is not None:
+                sp = sp*my[:, None]
+            meta = ['2D FFT (X and Y)',
+                    f'skip {skip} leading pts on X (echo centre)' if skip else 'no leading skip',
+                    f'window: {win_name}, X {ncols}→{nx}, Y {nrows}→{ny} '
+                    f'(zero fill {zf})',
+                    f'frequency in {funx} (X), {funy} (Y)']
+            meta += [f'passband {n}: {t}' for n, t in (('X', tx), ('Y', ty)) if t]
+            bands = '; '.join(f'{n} {t}' for n, t in (('X', tx), ('Y', ty)) if t)
+            self._set_result(*self._fft_out(sp, res_col, res_row), meta)
+            self.set_status(f'2D FFT; skip {skip}; X {ncols}→{nx}, Y {nrows}→{ny}'
+                            + (f'; passband {bands}.' if bands else '.'))
+            return
+
+        along_x = (mode == 0)
+        axis = 1 if along_x else 0
+        src_ax = self.src_col if along_x else self.src_row
+        # drop leading points so the transform starts at the echo centre; this
+        # sets t = 0 there and removes the dead-time first-order phase ramp.
+        skip = max(0, min(int(self.fft_skip.value()), self.src_i.shape[axis] - 2))
+        sl = [slice(None), slice(None)]; sl[axis] = slice(skip, None)
+        src_i = self.src_i[tuple(sl)]; src_q = self.src_q[tuple(sl)]
+        n0 = src_i.shape[axis]
+        win = sigproc.apodization_window(n0, win_name, wparam)
+        shape = [1, 1]; shape[axis] = n0
+        Z = (src_i + 1j*src_q)*win.reshape(shape)
+        n = sigproc.zerofill_length(n0, zf)
+        sp = np.fft.fftshift(np.fft.fft(Z, n=n, axis=axis), axes=axis)
+        fr, funit = self._freq_axis(n, src_ax['step'], src_ax['scale'])
+        df = float(fr[1] - fr[0]) if n > 1 else 1.0
+        freq_ax = self._axis(float(fr[0]), df, 'Frequency Offset', funit, auto=True)
+        if along_x:
+            res_col, res_row = freq_ax, self.src_row
+            mask, tag = self._fft_mask(fr, self.fft_x_type, self.fft_x_lo, self.fft_x_hi)
+        else:
+            res_col, res_row = self.src_col, freq_ax
+            mask, tag = self._fft_mask(fr, self.fft_y_type, self.fft_y_lo, self.fft_y_hi)
+        if mask is not None:
+            mshape = [1, 1]; mshape[axis] = n
+            sp = sp*mask.reshape(mshape)
+        meta = [f'FFT along {"X (within trace)" if along_x else "Y (indirect)"}',
+                f'skip {skip} leading pts (echo centre)' if skip else 'no leading skip',
+                f'window: {self.fft_window.currentText()}, '
+                f'points {n0} -> {n} (zero fill {self.fft_zerofill.currentText()})',
+                f'frequency in {funit}']
+        if tag:
+            meta.append(f'passband: {tag}')
+        self._set_result(*self._fft_out(sp, res_col, res_row), meta)
+        self.set_status(f'FFT along {"X" if along_x else "Y"}; skip {skip}; '
+                        f'{n0}→{n} pts' + (f'; passband {tag}.' if tag else '.'))
+
+    def _fft_out(self, sp, col, row):
+        if self.fft_mag.isChecked():
+            return np.abs(sp), np.zeros(sp.shape), col, row, ('|S|', '—')
+        return sp.real, sp.imag, col, row, ('Re', 'Im')
+
+    @staticmethod
+    def _passband_mask(freq, ftype, lo, hi):
+        """Boolean keep-mask over `freq`; cutoffs are fractions of f_max (Nyquist)."""
+        af = np.abs(np.asarray(freq, dtype=float))
+        fmax = float(np.max(af)) or 1.0
+        if ftype == 'Low-pass':
+            return af <= hi*fmax
+        if ftype == 'High-pass':
+            return af >= lo*fmax
+        if ftype == 'Band-pass':
+            return (af >= lo*fmax) & (af <= hi*fmax)
+        return np.ones_like(af, dtype=bool)
+
+    def _fft_mask(self, freq, type_widget, lo_widget, hi_widget):
+        """(keep-mask, description) for one FFT-tab passband; (None, '') when the
+        axis is set to 'None'."""
+        ftype = type_widget.currentText()
+        if ftype == 'None':
+            return None, ''
+        lo, hi = lo_widget.value(), hi_widget.value()
+        used = {'Low-pass': f'hi={hi:.4g}', 'High-pass': f'lo={lo:.4g}',
+                'Band-pass': f'lo={lo:.4g}, hi={hi:.4g}'}.get(ftype, '')
+        return (self._passband_mask(freq, ftype, lo, hi),
+                f'{ftype}, cutoff {used} x f_max')
+
+    def do_filter(self):
+        """FFT → zero the frequencies outside the passband → inverse FFT, along X,
+        Y or both axes with an independent filter each. The result stays in the
+        original domain, so the axes are untouched."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return
+        mode = self.filt_axis.currentIndex()   # 0 = X, 1 = Y, 2 = both
+        axes = (self.src_col, self.src_row) if mode == 2 else ((self.src_col,) if mode == 0 else (self.src_row,))
+        if not self._require_uniform(*axes):
+            return
+        Z = self.src_i + 1j*self.src_q
+        specs = []
+        if mode != 1:
+            specs.append(('X', 1, self.filt_x_type.currentText(),
+                          self.filt_x_lo.value(), self.filt_x_hi.value()))
+        if mode != 0:
+            specs.append(('Y', 0, self.filt_y_type.currentText(),
+                          self.filt_y_lo.value(), self.filt_y_hi.value()))
+
+        meta = ['Filter (FFT->mask->iFFT) along '
+                + {0: 'X (within trace)', 1: 'Y (indirect)',
+                   2: 'X and Y (independent)'}[mode]]
+        parts = []
+        for name, axis, ftype, lo, hi in specs:
+            n = Z.shape[axis]
+            if n < 2:
+                self.set_status(f'Need at least two points along {name} to filter.')
+                return
+            mask = self._passband_mask(np.fft.fftfreq(n), ftype, lo, hi)
+            shape = [1, 1]; shape[axis] = n
+            sp = np.fft.fft(Z, axis=axis)*mask.reshape(shape)
+            Z = np.fft.ifft(sp, axis=axis)
+            used = {'Low-pass': f'hi={hi:.4g}', 'High-pass': f'lo={lo:.4g}',
+                    'Band-pass': f'lo={lo:.4g}, hi={hi:.4g}'}.get(ftype, '')
+            meta.append(f'{name}: {ftype}, cutoff {used} x f_max')
+            parts.append(f'{name} {ftype} ({used})')
+
+        self._set_result(Z.real, Z.imag, self.src_col, self.src_row, ('I', 'Q'), meta)
+        self.set_status('Filter applied — ' + '; '.join(parts) + ' ×f_max.')
+
+    # --------------------------------------------------------------- shear
+    def _shear_geometry(self, i=None, col=None, row=None):
+        """(dipolar axis index, its step, echo-coordinate vector, axis names) for
+        the current Dipolar-axis choice. Rows (axis 0) are the indirect Y axis.
+        Defaults to the operation input; the collapse passes the result instead."""
+        i = self.src_i if i is None else i
+        col = self.src_col if col is None else col
+        row = self.src_row if row is None else row
+        dip = 0 if self.shear_axis.currentIndex() == 0 else 1
+        dax = row if dip == 0 else col
+        eax = col if dip == 0 else row
+        n_echo = i.shape[1 - dip]
+        tvec = self._axis_values(eax, n_echo)
+        step = float(dax['step']) or 1.0
+        scale = eax['scale']
+        try:
+            time_step = float(fft_module.time_axis_ns(step, dax['scale']))
+            time_vec = fft_module.time_axis_ns(tvec, eax['scale'])
+        except ValueError:
+            pass
+        else:
+            step, tvec, scale = time_step, time_vec, 'ns'
+        self.shear_tref.setSuffix(f' {scale}')
+        self.shear_fitwin.setSuffix(f' {scale}')
+        return dip, step, tvec, (dax['name'], eax['name'], scale)
+
+    @staticmethod
+    def _shear_ramp(n_dip, dstep, tvec, k, tref, dip):
+        """exp(2πi·ν_dip·k·(t − t_ref)), oriented to multiply the (row, col) map."""
+        nu = np.fft.fftfreq(n_dip, dstep)
+        ramp = np.exp(2j*np.pi*k*np.outer(nu, tvec - tref))
+        return ramp if dip == 0 else ramp.T
+
+    def auto_shear_ref(self):
+        """Set t_ref to the echo centre along the echo axis (the |I+iQ| envelope
+        averaged over the dipolar axis, so the dipolar modulation cancels)."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return
+        if not self._require_uniform(self.src_col, self.src_row):
+            return False
+        dip, _step, tvec, (_dn, ename, escale) = self._shear_geometry()
+        profile = np.sqrt(self.src_i**2 + self.src_q**2).mean(axis=dip)
+        idx = int(sigproc.echo_center(profile))
+        idx = min(max(idx, 0), len(tvec) - 1)
+        self.shear_tref.setValue(float(tvec[idx]))
+        self.set_status(f'Shear origin at the echo centre: {ename} = '
+                        f'{tvec[idx]:.4g} {escale} (point {idx}).')
+
+    def fit_shear_slope(self):
+        """Shear-scan estimator of k: for each k on a grid, shear and sum over the
+        echo axis, and take the k maximising the peak of the recovered dipolar
+        trace; parabolic refine on the grid maximum. The dipolar-axis transform
+        does not depend on k, so it is done once and only the ramp-weighted sum
+        is repeated. "Slope estimator" = Cross-correlation hands over to
+        _fit_slope_xcorr instead."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return False
+        if not self._require_uniform(self.src_col, self.src_row):
+            return False
+        dip, step, tvec, (dname, ename, escale) = self._shear_geometry()
+        n_dip = self.src_i.shape[dip]
+        tref = float(self.shear_tref.value())
+        half = float(self.shear_fitwin.value())
+        gate = (np.abs(tvec - tref) <= half) if half > 0 else np.ones(tvec.size, bool)
+        if gate.sum() < 2:
+            self.set_status('Fit window too narrow — widen it (0 = whole window).')
+            return False
+        Z = self.src_i + 1j*self.src_q
+        if self.shear_estimator.currentIndex() == 1:
+            return self._fit_slope_xcorr(Z if dip == 0 else Z.T, step, tvec, tref,
+                                         half, gate, escale)
+        sp = np.fft.fft(Z, axis=dip)
+        sp = sp[:, gate] if dip == 0 else sp[gate, :]
+        if dip == 1:
+            sp = sp.T                                  # -> (freq, echo) either way
+        dt = tvec[gate] - tref
+        nu = np.fft.fftfreq(n_dip, step)
+        phase = 2j*np.pi*np.outer(nu, dt)
+
+        ks = np.arange(-1.0, 1.0001, 0.01)
+        amp = np.empty(ks.size)
+        # the ramp steps by a constant factor along the k grid, so it is advanced
+        # by one multiply per point instead of re-exponentiating the whole map
+        ramp = np.exp(ks[0]*phase)
+        dramp = np.exp((ks[1] - ks[0])*phase)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for j in range(ks.size):
+                tr = np.abs(np.fft.ifft((sp*ramp).sum(axis=1)))  # phase-blind
+                amp[j] = tr.max() - np.median(tr)
+                ramp *= dramp
+        finally:
+            QApplication.restoreOverrideCursor()
+        j = int(amp.argmax())
+        kbest = float(ks[j])
+        if 3 <= j < ks.size - 3:                       # parabolic refine off the grid
+            p = np.polyfit(ks[j-3:j+4], amp[j-3:j+4], 2)
+            if p[0] < 0:
+                kbest = float(-p[1]/(2*p[0]))
+        gain = amp[j]/amp[np.abs(ks).argmin()] if amp[np.abs(ks).argmin()] else float('nan')
+        self.shear_k.setValue(kbest)                   # fires the live preview
+        win = f'±{half:.4g} {escale}' if half > 0 else 'whole window'
+        self.set_status(f'Fitted slope k = {kbest:+.4f} ({dname} per {ename}), '
+                        f'peak ×{gain:.2f} over k = 0; {win}, {int(gate.sum())} pts.')
+        return True
+
+    def _fit_slope_xcorr(self, Z, step, tvec, tref, half, gate, escale):
+        """Ridge-shift estimator of k on Z oriented (dipolar, echo): each echo
+        column inside the fit window where the envelope exceeds 15 % of its
+        maximum is matched to the summed columns within 6 of t_ref by a sub-row
+        shift, a scale, an offset and a straight line, least-squares over a fixed
+        band of rows clear of the record ends; the shift, started from the
+        cross-correlation lag, is fitted linearly against t − t_ref."""
+        try:
+            from scipy.interpolate import CubicSpline
+            from scipy.optimize import minimize_scalar
+        except ImportError:
+            self.set_status('Cross-correlation needs scipy: pip install -e .[math]')
+            return False
+        idx = np.arange(Z.shape[0])
+        n = idx.astype(float)
+
+        def detrend(y):
+            y = y - np.polyval(np.polyfit(idx, y, 3), idx)
+            return y - y.mean()
+
+        R = Z.real
+        env = np.abs(Z).mean(axis=0)
+        cols = np.where(gate & (env > 0.15*env[gate].max()))[0]
+        if cols.size < 4:
+            self.set_status('Too few echo columns above 15 % of the envelope — '
+                            'widen the fit window (0 = whole window).')
+            return False
+        near = np.abs(tvec - tref) <= 6
+        if not near.any():
+            near = [np.abs(tvec - tref).argmin()]
+        r = R[:, near].sum(axis=1)
+        M = int(np.ceil(0.65*np.abs(tvec[cols] - tref).max()/abs(step))) + 1
+        m = (n >= M) & (n <= n.size - 1 - M)
+        if m.sum() < 10:
+            self.set_status('Fit window too wide for the dipolar record — narrow it.')
+            return False
+        nm = n[m]
+        u = (nm - n.mean())/n.mean()
+        Q = np.linalg.qr(np.column_stack([r[m], np.ones(nm.size), u]))[0]
+        ref = detrend(r)
+        mid, w = Z.shape[0] - 1, min(25, Z.shape[0] - 1)
+        lag = np.empty(cols.size)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for j, c in enumerate(cols):
+                seg = np.correlate(detrend(R[:, c]), ref, 'full')[mid - w:mid + w + 1]
+                l0 = float(np.clip(int(seg.argmax()) - w, -M + 1, M - 1))
+                S = CubicSpline(n, R[:, c])
+
+                def cost(s):
+                    y = S(nm + s)
+                    return float(np.sum((y - Q @ (Q.T @ y))**2))
+
+                grid = np.arange(max(-M + 1, l0 - 4), min(M - 1, l0 + 4) + 1e-9, 0.25)
+                s0 = grid[int(np.argmin([cost(s) for s in grid]))]
+                lag[j] = minimize_scalar(cost, bounds=(s0 - 0.3, s0 + 0.3),
+                                         method='bounded').x
+        finally:
+            QApplication.restoreOverrideCursor()
+        A, cov = np.polyfit(tvec[cols] - tref, lag, 1, cov=True)
+        k, err = float(A[0]*step), float(np.sqrt(cov[0, 0])*abs(step))
+        self.shear_k.setValue(k)
+        win = f'window ±{half:.4g} {escale}' if half > 0 else 'whole window'
+        self.set_status(f'Fitted slope k = {k:+.4f} ± {err:.4f} (cross-correlation '
+                        f'over {cols.size} columns, {win}).')
+        return True
+
+    @staticmethod
+    def _trace_quality(trace, step):
+        """Peak above the median baseline, and S/N against the noise read off the
+        top 40 % of the trace's own spectrum — well above any dipolar frequency,
+        so it is signal-independent and gated and sheared traces are compared on
+        the same footing."""
+        tr = np.asarray(trace, dtype=float)
+        tr = tr - np.median(tr)
+        nu = np.abs(np.fft.fftfreq(tr.size))
+        band = nu >= 0.6*nu.max()
+        sp = np.fft.fft(tr - tr.mean())
+        noise = np.sqrt((np.abs(sp[band])**2).mean()/tr.size) if band.any() else 0.0
+        return float(tr.max()), (float(tr.max()/noise) if noise else float('nan'))
+
+    def do_shear(self):
+        """V′(t_dip, t) = V(t_dip + k·(t − t_ref), t), as the exact phase ramp
+        exp(2πi·ν_dip·k·(t − t_ref)) on the dipolar-axis spectrum. Unitary and
+        interpolation-free; the axes are unchanged, so it chains like the rest."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return
+        if not self._require_uniform(self.src_col, self.src_row):
+            return False
+        dip, step, tvec, (dname, ename, escale) = self._shear_geometry()
+        n_dip = self.src_i.shape[dip]
+        if n_dip < 2:
+            self.set_status(f'Need at least two points along {dname} to shear.')
+            return
+        k = float(self.shear_k.value())
+        tref = float(self.shear_tref.value())
+        Z = self.src_i + 1j*self.src_q
+        ramp = self._shear_ramp(n_dip, step, tvec, k, tref, dip)
+        Z = np.fft.ifft(np.fft.fft(Z, axis=dip)*ramp, axis=dip)
+        pk, sn = self._trace_quality(Z.real.sum(axis=1 - dip), step)
+        pk0, _ = self._trace_quality(self.src_i.sum(axis=1 - dip), step)
+        gain = pk/pk0 if pk0 else float('nan')
+        meta = [f'Shear of {dname} against {ename} (FFT phase ramp, no interpolation)',
+                f'k = {k:+.4f}, '
+                f't_ref = {tref:.4g} {escale}',
+                f'flat sum over {ename}: peak {pk:.6g} (x{gain:.2f} unsheared), '
+                f'S/N {sn:.0f}']
+        self._set_result(Z.real, Z.imag, self.src_col, self.src_row, ('Re', 'Im'), meta)
+        self.set_status(f'Shear applied: k = {k:+.4f}, t_ref = {tref:.4g} {escale}; '
+                        f'flat sum peak {pk:.6g} (×{gain:.2f} over unsheared), '
+                        f'S/N {sn:.0f}.')
+
+    def collapse_shear(self):
+        """Sum the straightened map over the echo window and send the dipolar
+        trace to the 1D tool. The window is the t_ref ± "Fit window" the slope
+        was measured with, so the delivered peak is the "flat sum" the shear
+        reports. The Slice tab does the general version — any index range, any
+        direction, averaged rather than summed."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return
+        i, q, col, row = self._current_iq()
+        if not self._require_uniform(col, row):
+            return False
+        dip, step, tvec, (dname, ename, escale) = self._shear_geometry(i, col, row)
+        dax = row if dip == 0 else col
+        tref = float(self.shear_tref.value())
+        half = float(self.shear_fitwin.value())
+        gate = (np.abs(tvec - tref) <= half) if half > 0 else np.ones(tvec.size, bool)
+        if not gate.any():
+            self.set_status('Echo window empty — widen "Fit window ±" (0 = whole '
+                            'window) or move t_ref onto the echo.')
+            return
+        re = (i[:, gate] if dip == 0 else i[gate, :]).sum(axis=1 - dip)
+        im = (q[:, gate] if dip == 0 else q[gate, :]).sum(axis=1 - dip)
+        x = self._axis_values(dax, re.size)
+        pk, sn = self._trace_quality(re, step)
+        xname = f"{dax['name']} ({dax['scale']})" if dax['scale'] else dax['name']
+        # the buffer is written with the platform's default codec: keep the
+        # label ASCII, and name it by the echo window it was summed over
+        gt = tvec[gate]
+        name = f'dipolar {gt[0]:.4g}-{gt[-1]:.4g}'
+        try:
+            self._write_buffer([(name, x, re), (name + '_1', x, im)], xname=xname)
+        except Exception as e:
+            self.set_status(f'Could not write transfer buffer: {e}')
+            return
+        win = f'{tref:.4g} ± {half:.4g} {escale}' if half > 0 else f'the whole {ename}'
+        self.set_status(f'Summed {int(gate.sum())} {ename} points over {win} '
+                        f'into a {dname} trace (peak {pk:.6g}, S/N {sn:.0f}); sent '
+                        f'to buffer as an I/Q pair. Click "Load from plot" in the '
+                        f'1D Data Treatment window.')
+
+    # ---------------------------------------------------------- auto shear
+    @staticmethod
+    def _pulse_freq(value):
+        """Centre frequency in MHz of an AWG pulse-dict 'frequency' entry: a
+        plain string ('100 MHz') or a chirp pair (('90 MHz', '110 MHz'))."""
+        vals = value if isinstance(value, (list, tuple)) else [value]
+        out = [float(m.group(1)) for m in
+               (re.match(r'\s*([-+0-9.eE]+)\s*MHz', str(v)) for v in vals) if m]
+        return sum(out)/len(out) if out else None
+
+    def _header_if(self):
+        """Nominal IF in MHz from the loaded file's header: the frequency shared
+        by most of its AWG pulses. Only the AWG pulse dicts carry a frequency;
+        a DEER header also holds a pump pulse at another frequency, and the
+        three observer pulses outvote it. An explicit 'Frequency Shift' line wins."""
+        shift = header_frequency_shift(self.header_lines)
+        if shift is not None:
+            return shift
+        freqs = []
+        for ln in self.header_lines:
+            s = ln.strip()
+            if not s.startswith('{'):
+                continue
+            try:
+                d = ast.literal_eval(s)
+            except Exception:
+                continue
+            if not isinstance(d, dict) or 'frequency' not in d:
+                continue
+            if str(d.get('function', '')).upper() == 'BLANK':
+                continue
+            f = self._pulse_freq(d['frequency'])
+            if f:
+                freqs.append(round(f, 6))
+        return max(freqs, key=freqs.count) if freqs else None
+
+    def _if_sign(self, f_if):
+        """Sign of the first-order term that brings the record to baseband: the
+        line sits at ±IF and the ramp has to shift it the other way. Decided on
+        the raw spectrum, summed over the traces, within half an IF of the line."""
+        step = float(fft_module.time_axis_ns(self.src_col['step'], self.src_col['scale']))
+        fr = np.fft.fftfreq(self.src_i.shape[1], step)*1000.0        # MHz
+        S = np.abs(np.fft.fft(self.src_i + 1j*self.src_q, axis=1)).sum(axis=0)
+        band = np.abs(np.abs(fr) - abs(f_if)) <= 0.5*abs(f_if)
+        return -1.0 if S[band & (fr > 0)].sum() > S[band & (fr < 0)].sum() else 1.0
+
+    def auto_shear(self):
+        """Walk the documented shear chain from the raw record in one click:
+        demodulate at the header IF, low-pass X below the LO leak, measure φ₁/φ₀
+        on the cleaned trace, then t_ref, k and the shear itself. Each step is
+        chained as "Result → input", so the Phase / Filter tabs are left showing
+        exactly what ran and the result can be collapsed in the Slice tab."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return
+        prev_live = self._suppress_live
+        self._suppress_live = True
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.reset_to_raw()
+            if not self._require_uniform(self.src_col, self.src_row):
+                return
+            if self._is_freq_axis(self.src_col) or not self.src_col['step']:
+                self.set_status('Auto shear needs a time-domain X axis with a '
+                                'non-zero step.')
+                return
+            step_ns = float(fft_module.time_axis_ns(self.src_col['step'], self.src_col['scale']))
+            dip_step_ns = float(fft_module.time_axis_ns(self.src_row['step'], self.src_row['scale']))
+            if dip_step_ns == 0:
+                self.set_status('Auto shear needs non-zero dipolar-axis spacing.')
+                return
+            if self.shear_axis.currentIndex() != 0:
+                self.set_status('Auto shear needs Y as the dipolar axis and X as the echo axis.')
+                return
+            f_if, source = self._header_if(), 'file header'
+            if f_if is None:
+                f_if, source = float(self.phase_first.value()), 'Phase tab'
+            if not f_if:
+                self.set_status('No AWG frequency in the file header — type the '
+                                'nominal IF into the time-domain Frequency shift and '
+                                'press Auto shear again.')
+                return
+            f_if = self._if_sign(f_if)*abs(f_if)
+            self.phase_mode.setCurrentIndex(0)
+            self.phase_zero.setValue(0.0)
+            self.phase_first.setValue(f_if)
+            if not self.do_phase():
+                return
+            self.promote_result()
+            # everything above IF/2 is the LO leak (at the IF) and the mirror
+            # image (at twice it); the demodulated echo sits at 0
+            cut = abs(f_if)*abs(step_ns)/1000.0
+            self.filt_axis.setCurrentIndex(0)
+            self.filt_x_type.setCurrentText('Low-pass')
+            self.filt_x_hi.setValue(min(1.0, max(10**-self.filt_x_hi.decimals(), cut)))
+            cut = self.filt_x_hi.value()        # what the cutoff box could hold
+            self.do_filter()
+            self.promote_result()
+            self.phase_first.setValue(0.0)
+            if not self.auto_phase_first() or not self.do_phase():
+                return
+            self.promote_result()
+            self.auto_shear_ref()
+            if not self.fit_shear_slope():
+                return
+            self.do_shear()
+            done = self.status.text()
+            self.set_status(f'Auto shear — IF {f_if:g} MHz ({source}), X low-pass '
+                            f'{cut:.4g} ×f_max, residual shift = {self.phase_first.value():.3f} '
+                            f'MHz, constant phase = {self.phase_zero.value():.2f} deg; '
+                            f'{done[0].lower()}{done[1:]}')
+        except ValueError as e:
+            self.set_status(f'Auto shear: {e}')
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._suppress_live = prev_live
+
+    # -------------------------------------------------------------- output
+    # ---------------------------------------------------------- per-trace fit
+    def _current_iq(self):
+        """The dataset operations act on: the result if one exists, else the
+        current source (raw or a promoted result)."""
+        if self.has_result():
+            return self.res_i, self.res_q, self.res_col, self.res_row
+        return self.src_i, self.src_q, self.src_col, self.src_row
+
+    @staticmethod
+    def _channel(i, q, name):
+        if name == 'Magnitude':
+            return np.hypot(i, q)
+        if name.startswith('Imag'):
+            return q
+        return i                                # Real (I) — default
+
+    @staticmethod
+    def _param_unit(pname, decay_scale):
+        if pname.startswith('k') or pname == 'Tm':
+            return decay_scale                  # a time constant in decay units
+        if pname == 'beta':
+            return ''
+        return 'V'                              # amplitudes / offset
+
+    def _fit_geometry(self):
+        """Resolve (channel matrix as rows-of-decays, decay-axis values,
+        other-axis values, other-axis dict, decay-axis dict) for the current
+        data and the chosen decay axis."""
+        i, q, col, row = self._current_iq()
+        chan = self._channel(i, q, self.fit_channel.currentText())
+        if self.fit_axis.currentIndex() == 0:            # X = decay (rows are decays)
+            xaxis = self._axis_values(col, chan.shape[1])
+            traces = chan
+            other = self._axis_values(row, chan.shape[0])
+            return traces, xaxis, other, row, col
+        # Y = decay (columns are decays)
+        xaxis = self._axis_values(row, chan.shape[0])
+        traces = chan.T
+        other = self._axis_values(col, chan.shape[1])
+        return traces, xaxis, other, col, row
+
+    _FIT_STATS_TOOLTIP = (
+        '<div style="max-width: 380px;">'
+        '<b>Per-trace fit quality</b><br>'
+        'Every trace along the decay axis is fit independently; the summary '
+        'reports the spread (min / median / max) of two diagnostics across the '
+        'series:'
+        '<ul style="margin: 4px 0 0 -22px;">'
+        '<li><b>R²</b> — fraction of variance explained per trace (1 = '
+        'perfect). A low <i>median</i> means the model does not suit the data; '
+        'a wide min–max spread means some traces (often the noisy late/early '
+        'ones) fit far worse than others.</li>'
+        '<li><b>Durbin–Watson</b> — residual-autocorrelation test. <b>≈ 2</b> '
+        'means random residuals; well below 2 means the residuals drift '
+        'systematically — the model is the wrong shape even where R² looks '
+        'high. A median far from 2 is a red flag for the whole series.</li>'
+        '</ul>'
+        'Traces below <b>Min R²</b> are dropped from the parameter map.'
+        '</div>')
+
+    def do_fit_2d(self):
+        if self._fitting:                          # don't stack a second fit
+            return
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return
+        model = RELAX_MODELS[self.fit_model.currentIndex()]
+        pname = self.fit_param.currentText()
+        no_offset = self.fit_no_offset.isChecked()
+        fixed = self._fit_fixed(model)
+        minr2 = float(self.fit_minr2.value())
+        traces, xaxis, other, other_ax, decay_ax = self._fit_geometry()
+        n = traces.shape[0]
+        params = np.full(n, np.nan)
+        r2 = np.full(n, np.nan)
+        dw = np.full(n, np.nan)
+        fails = 0
+        # The fit loop is CPU-bound and would freeze the window ("not responding")
+        # for many traces, so we pump the Qt event loop every few traces and show
+        # progress. The Run-fit button is disabled meanwhile (the _fitting guard
+        # also blocks re-entry from the pumped events); `traces` is a snapshot, so
+        # loading new data mid-fit cannot corrupt the running loop.
+        self._fitting = True
+        self._cancel_fit = False
+        self.fit_run_btn.setEnabled(False)
+        self.fit_run_btn.setStyleSheet(BUTTON_BUSY_STYLE)
+        self.fit_run_btn.setText('Fitting…')
+        self.fit_cancel_btn.setEnabled(True)
+        chunk = 8
+        done = 0
+        cancelled = False
+        try:
+            for k in range(n):
+                y = np.asarray(traces[k], float)
+                try:
+                    res = self.fitter.fit(model, xaxis, y, no_offset=no_offset,
+                                          fixed=fixed)
+                    names = list(res['param_names'])
+                    if pname in names:
+                        params[k] = res['popt'][names.index(pname)]
+                    r2[k] = res['r_squared']
+                    dw[k] = res.get('stats', {}).get('durbin_watson', np.nan)
+                    if not np.isfinite(r2[k]) or r2[k] < minr2:
+                        params[k] = np.nan
+                except Exception:
+                    fails += 1
+                done = k + 1
+                if k % chunk == 0 or k == n - 1:
+                    self.status.setText(f'Fitting trace {done}/{n}…')
+                    QApplication.processEvents()
+                    if self._cancel_fit:           # set by the Cancel button
+                        cancelled = True
+                        break
+        finally:
+            self._fitting = False
+            self._cancel_fit = False
+            self.fit_run_btn.setEnabled(True)
+            self.fit_run_btn.setStyleSheet(BUTTON_STYLE)
+            self.fit_run_btn.setText('Run fit')
+            self.fit_cancel_btn.setEnabled(False)
+        valid = np.isfinite(params)
+        ngood = int(valid.sum())
+        self.fit_map = {'x': other, 'param': params, 'r2': r2, 'pname': pname,
+                        'model': model, 'channel': self.fit_channel.currentText(),
+                        'no_offset': no_offset, 'fixed': fixed,
+                        'other_name': other_ax['name'],
+                        'other_scale': other_ax['scale'], 'decay_scale': decay_ax['scale']}
+        tag = ' (cancelled)' if cancelled else ''
+        if ngood == 0:
+            self.fit_info.setText(f'<b>No valid fits{tag}.</b> '
+                                  + ('Cancelled before any trace converged. '
+                                     if cancelled else
+                                     'Try another model, the Magnitude channel, '
+                                     'or relax Min R².'))
+            self.set_status(f'Fit produced no valid traces{tag}.')
+            return
+        punit = self._param_unit(pname, decay_ax['scale'])
+        name = (self.name_edit.text().strip() or 'FT Data 2D') + f' — {pname} map'
+        try:
+            general.plot_1d(name, other[valid], params[valid], label=pname,
+                            xname=other_ax['name'], xscale=other_ax['scale'],
+                            yname=pname, yscale=punit)
+        except Exception as e:
+            self.set_status(f'Fit done but could not plot map: {e}')
+        pv = params[valid]
+        rv = r2[valid]
+        dwv = dw[valid]
+        scope = f"{done}/{n} traces" if cancelled else f"{n} traces"
+        rows = [[f'<b>{pname}</b> ({punit})', f'{np.nanmin(pv):.4g}',
+                 f'{np.nanmedian(pv):.4g}', f'{np.nanmax(pv):.4g}'],
+                ['R²', f'{np.nanmin(rv):.3f}', f'{np.nanmedian(rv):.3f}',
+                 f'{np.nanmax(rv):.3f}']]
+        if np.any(np.isfinite(dwv)):
+            dw_med = np.nanmedian(dwv)
+            colour = ('rgb(120, 200, 120)' if 1.5 <= dw_med <= 2.5
+                      else 'rgb(214, 160, 78)')
+            rows.append([f'<span style="color:{colour};">Durbin–Watson</span>',
+                         f'{np.nanmin(dwv):.2f}', f'{dw_med:.2f}',
+                         f'{np.nanmax(dwv):.2f}'])
+        table = _html_table(['', 'min', 'median', 'max'], rows)
+        self.fit_info.setText(
+            f'<div style="line-height: 150%;"><b style="color: rgb(211, 194, 78);">'
+            f'{model}</b>' + (f' (β = {fixed["beta"]:g})' if fixed else '')
+            + f'{tag} · {self.fit_channel.currentText()} · '
+            f'{ngood} valid of {scope}'
+            + (f', {fails} failed' if fails else '')
+            + f'<br>{table}</div>')
+        self.set_status(f'Per-trace fit{tag}: {ngood} valid of {scope}; '
+                        f'{pname} map plotted.')
+
+    def cancel_fit(self):
+        """Ask the running per-trace fit loop to stop at the next chunk boundary;
+        traces already fit are kept and mapped."""
+        if self._fitting:
+            self._cancel_fit = True
+            self.status.setText('Cancelling fit…')
+
+    def _sync_slice_from_cursor(self, *args):
+        """Follow the heatmap crosshair with the Slice-tab "Trace #". The image
+        is (nX points, nY traces); a slice along X picks a trace (the Y/indirect
+        index), a slice along Y picks a point (the X index). The crosshair sets
+        both at once, so "Slice along" stays user-controlled and only the index
+        for the chosen direction is synced. No-ops unless the cross-section is
+        active (otherwise the indices don't track the cursor)."""
+        cd = self.cross_dock
+        if not getattr(cd, 'cross_section_enabled', False) or not hasattr(self, 'slice_spin'):
+            return
+        if self.slice_axis.currentIndex() == 0:        # along X → trace = Y index
+            idx = int(getattr(cd, 'y_cross_index', 0))
+        else:                                          # along Y → trace = X index
+            idx = int(getattr(cd, 'x_cross_index', 0))
+        val = idx + 1                                  # cross index is 0-based; spin is 1-based
+        if val != self.slice_spin.value():
+            self.slice_spin.setValue(val)              # fires _update_slice_label
+
+    def _update_slice_label(self, *args):
+        if not hasattr(self, 'slice_spin'):
+            return
+        if self.src_i is None:
+            self.slice_label.setText('')
+            return
+        i, q, col, row = self._current_iq()
+        if self.slice_axis.currentIndex() == 0:
+            ntr, axis = i.shape[0], row
+        else:
+            ntr, axis = i.shape[1], col
+        self.slice_spin.blockSignals(True)
+        self.slice_spin.setRange(1, max(1, ntr))       # 1-based: traces 1…ntr
+        self.slice_spin.blockSignals(False)
+        idx = int(self.slice_spin.value()) - 1         # 0-based for the coordinate
+        coord = self._axis_values(axis, ntr)[idx]
+        if getattr(self, 'slice_avg', None) is not None and self.slice_avg.isChecked():
+            self.slice_spin2.blockSignals(True)
+            self.slice_spin2.setRange(1, max(1, ntr))
+            self.slice_spin2.blockSignals(False)
+            idx2 = int(self.slice_spin2.value()) - 1
+            lo, hi = sorted((idx, idx2))
+            c2 = self._axis_values(axis, ntr)[idx2]
+            self.slice_label.setText(f"{axis['name']} = {coord:.4g}…{c2:.4g} "
+                                     f"{axis['scale']} (avg {hi - lo + 1} of {ntr})")
+        else:
+            self.slice_label.setText(f"{axis['name']} = {coord:.4g} {axis['scale']} (of {ntr})")
+
+    def _write_buffer(self, curves, xname=''):
+        """Write a one-shot 1D-tool mailbox (treatment_buffer.csv): interleaved
+        x0,y0,x1,y1,… columns padded with NaN, '# labels:' header naming the curves.
+        An optional '# xname:' line carries the X axis name+unit so the 1D tool can
+        label and SI-prefix the axis (e.g. a 's' slice axis then reads in ns)."""
+        maxlen = max(np.asarray(x).size for _, x, _ in curves)
+        buf = np.full((maxlen, 2*len(curves)), np.nan)
+        labels = []
+        for j, (lab, x, y) in enumerate(curves):
+            x = np.asarray(x, float); y = np.asarray(y, float)
+            buf[:x.size, 2*j] = x
+            buf[:y.size, 2*j + 1] = y
+            labels.append(str(lab).replace('|', '/'))
+        header_lines = ['Atomize data treatment buffer', 'labels: ' + '|'.join(labels)]
+        if xname:
+            header_lines.append('xname: ' + str(xname).replace('\n', ' '))
+        header = '\n'.join(header_lines)
+        np.savetxt(BUFFER_PATH, buf, delimiter=',', fmt='%.6e', header=header, comments='# ')
+
+    def _compute_slice(self):
+        """Build the current slice (Re/Im vs the decay axis), averaging the
+        selected index range when 'Average up to #' is on. Returns a dict, or
+        None (with a status set) when no dataset is loaded."""
+        if self.src_i is None:
+            self.set_status('Open an I/Q dataset first.')
+            return None
+        i, q, col, row = self._current_iq()
+        averaging = self.slice_avg.isChecked()
+        along_x = self.slice_axis.currentIndex() == 0
+        if along_x:                                      # X = slice; row(s)
+            ntr = i.shape[0]
+            x = self._axis_values(col, i.shape[1])
+            dax, oax = col, row
+        else:                                            # Y = slice; column(s)
+            ntr = i.shape[1]
+            x = self._axis_values(row, i.shape[0])
+            dax, oax = row, col
+        # Trace # is 1-based in the UI (matches the cursor label); -1 here for the
+        # 0-based array index. lo/hi/tag are reported 1-based to the user.
+        idx = min(max(int(self.slice_spin.value()) - 1, 0), ntr - 1)
+        self.slice_spin.setValue(idx + 1)
+        idx2 = min(max(int(self.slice_spin2.value()) - 1, 0), ntr - 1)
+        lo, hi = sorted((idx, idx2))
+        mean = averaging and hi > lo
+        if mean:
+            if along_x:
+                re = i[lo:hi + 1].mean(axis=0); im = q[lo:hi + 1].mean(axis=0)
+            else:
+                re = i[:, lo:hi + 1].mean(axis=1); im = q[:, lo:hi + 1].mean(axis=1)
+            tag = f'{lo + 1}-{hi + 1}'
+            coord = float(self._axis_values(oax, ntr)[lo:hi + 1].mean())
+        else:
+            # Not averaging: use the selected Trace # directly. lo = min(idx, idx2)
+            # would snap to the (default-0) "average up to #" spin and always send
+            # trace 0 instead of the indicated one.
+            re = i[idx] if along_x else i[:, idx]
+            im = q[idx] if along_x else q[:, idx]
+            lo = hi = idx                  # report the actual trace, not the spin2 default
+            tag = str(idx + 1)
+            coord = self._axis_values(oax, ntr)[idx]
+        return {'x': x, 're': re, 'im': im, 'dax': dax, 'oax': oax,
+                'tag': tag, 'coord': coord, 'mean': mean, 'lo': lo, 'hi': hi}
+
+    def save_slice(self):
+        """Save the current (optionally averaged) slice to a CSV: decay axis, Re, Im."""
+        sl = self._compute_slice()
+        if sl is None:
+            return
+        file_path = self._save_dialog()
+        if not file_path:
+            return
+        dax, oax = sl['dax'], sl['oax']
+        arr = np.column_stack([np.asarray(sl['x'], float),
+                               np.asarray(sl['re'], float),
+                               np.asarray(sl['im'], float)])
+        kind = (f'mean of traces {sl["lo"] + 1}–{sl["hi"] + 1}' if sl['mean']
+                else f'trace {sl["lo"] + 1}')
+        header = '\n'.join([
+            f'2D slice ({kind}); {oax["name"]} = {sl["coord"]:.6g} {oax["scale"]}',
+            f'columns: {dax["name"]} ({dax["scale"]}), Re/I, Im/Q'])
+        self.opener.save_data(file_path, arr, header=header, mode='w')
+        self.set_status(f'Saved slice {sl["tag"]} to {os.path.basename(file_path)}.')
+
+    def send_slice_to_1d(self):
+        sl = self._compute_slice()
+        if sl is None:
+            return
+        x, re, im = sl['x'], sl['re'], sl['im']
+        dax, oax, tag, coord, mean = (sl['dax'], sl['oax'], sl['tag'],
+                                      sl['coord'], sl['mean'])
+        # carry the decay axis name+unit so the 1D tool labels and SI-prefixes it
+        # (a slice taken in 's' then displays in ns rather than raw 2e-9).
+        xname = f"{dax['name']} ({dax['scale']})" if dax['scale'] else dax['name']
+        # '<base>' + '<base>_1' is the companion-channel convention of the main
+        # window and of the I/Q file pair; the 1D tool groups the two into one
+        # trace and ticks its pair box only for labels shaped like that.
+        name = f'slice {tag}'
+        try:
+            self._write_buffer([(name, x, re), (name + '_1', x, im)], xname=xname)
+        except Exception as e:
+            self.set_status(f'Could not write transfer buffer: {e}')
+            return
+        # Deliberately not plotted in the main GUI: the slice goes only to the 1D
+        # tool's transfer buffer, so it doesn't clutter the main window's docks.
+        what = (f'Mean slice {tag}' if mean else f'Slice #{tag}')
+        self.set_status(f'{what} ({oax["name"]} = {coord:.4g} {oax["scale"]}) '
+                        f'sent to buffer as an I/Q pair. In the 1D Data Treatment '
+                        f'window click "Load from plot".')
+
+    def save_fit_map(self):
+        if not self.fit_map:
+            self.set_status('Run a fit first — no map to save.')
+            return
+        file_path = self._save_dialog()
+        if not file_path:
+            return
+        m = self.fit_map
+        arr = np.column_stack([m['x'], m['param'], m['r2']])
+        punit = self._param_unit(m['pname'], m['decay_scale'])
+        header = '\n'.join([
+            '2D per-trace fit map',
+            f'model = {m["model"]}, channel = {m["channel"]}, fix_offset = {m["no_offset"]}'
+            + (f', fix_beta = {m["fixed"]["beta"]:g}' if m['fixed'] else ''),
+            f'columns: {m["other_name"]} ({m["other_scale"]}), '
+            f'{m["pname"]} ({punit}), R^2'])
+        self.opener.save_data(file_path, arr, header=header, mode='w')
+        self.set_status(f'Saved fit map to {os.path.basename(file_path)}.')
+
+    def save_result(self):
+        if not (self.has_result() or self.src_i is not None):
+            self.set_status('Nothing to save — load data first.')
+            return
+        file_path = self._save_dialog()
+        if not file_path:
+            return
+        if self.has_result():
+            i, q, col, row, meta = (self.res_i, self.res_q, self.res_col,
+                                    self.res_row, self.res_meta)
+        else:
+            i, q, col, row, meta = (self.src_i, self.src_q, self.src_col,
+                                    self.src_row, ['Raw I/Q'])
+        # save_data writes a (2, nX, nY) array as name.csv (real) + name_1.csv
+        # (imag), each transposed back to [trace, point] — the load format.
+        arr = np.array([np.transpose(i), np.transpose(q)])
+        axis_lines = []
+        for label, ax in (('X', col), ('Y', row)):
+            coordinates = (f'values {np.asarray(ax["values"]).tolist()}' if ax.get('values') is not None
+                           else f'start {ax["start"]:.17g} step {ax["step"]:.17g}')
+            axis_lines.append(f'{label} ({ax["name"]}/{ax["scale"]}): {coordinates}')
+        header = '\n'.join(meta + axis_lines + [
+            'channel 0 = real/I (this file), channel 1 = imag/Q (_1 file)'])
+        axes = (self._axis_values(col, i.shape[1]),
+                self._axis_values(row, i.shape[0]))
+        self.opener.save_data(file_path, arr, header=header, mode='w', axes=axes,
+                              axes_units=(col['scale'], row['scale']))
+        h5 = file_path.lower().endswith('.h5')
+        self.set_status(f'Saved I/Q to {os.path.basename(file_path)}'
+                        f'{"" if h5 else " (+ _1)"}.')
+
+
+def main():
+    app = QApplication(sys.argv)
+    from atomize.general_modules.gui_style import apply_app_style
+    apply_app_style(app, app_id='Atomize.ITC.DataTreatment2D', desktop='treat2d')
+    window = MainWindow()
+    window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    window.destroyed.connect(app.quit)
+    window.window_size = WindowSize(window, 'analysis/data_treatment_2d/size')
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    main()

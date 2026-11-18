@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.9.0", "hatch-vcs", "toml"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atomize-treatment"
+version = "0.1.0"
+authors = [
+    {name = "Atomize Developers"}
+]
+description = "Data treatment tools for Atomize: 1D/2D processing and fitting, DEER analysis, pulse sequences, excitation profiles and spin dynamics"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["EPR", "data treatment", "DEER", "fitting", "spectroscopy"]
+license = "MIT"
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX",
+    "Topic :: Scientific/Engineering",
+]
+
+dependencies = ["atomize-py[math]>=0.5"]
+license-files = ["license.md"]
+
+[project.scripts]
+atomize-treatment = "atomize.treatment.data_treatment:main"
+atomize-treatment-2d = "atomize.treatment.data_treatment_2d:main"
+atomize-deer = "atomize.treatment.deer_analysis:main"
+atomize-seqcalc = "atomize.treatment.sequence_calculator:main"
+atomize-excitation = "atomize.treatment.excitation_profile:main"
+atomize-spin-sim = "atomize.treatment.spin_dynamics_sim:main"
+
+[project.urls]
+Homepage = "https://github.com/Anatoly1010/Atomize_treatment"
+Core = "https://github.com/Anatoly1010/Atomize"
+
+[tool.hatch.build.targets.wheel]
+packages = ["atomize"]
